@@ -4,11 +4,11 @@
 # MIT Licensed; see the LICENSE file in this repository.
 #
 
-# NOTE: run with TEST_VERBOSE=1 for verbose sharness tests.
+# NOTE: Run with TEST_VERBOSE=1 for verbose sharness tests.
 
 T = $(sort $(wildcard t[0-9][0-9][0-9][0-9]-*.sh))
 BINS = bin/random bin/multihash bin/ipfs bin/pollEndpoint \
-	   bin/iptb bin/go-sleep bin/random-files
+	   bin/iptb bin/go-sleep bin/random-files bin/go-timeout bin/hang-fds
 SHARNESS = lib/sharness/sharness.sh
 IPFS_ROOT = ../..
 
@@ -19,11 +19,11 @@ all: aggregate
 
 clean: clean-test-results
 	@echo "*** $@ ***"
-	-rm -rf bin/ipfs
+	rm -rf $(BINS)
 
 clean-test-results:
 	@echo "*** $@ ***"
-	-rm -rf test-results
+	rm -rf test-results
 
 $(T): clean-test-results deps
 	@echo "*** $@ ***"
@@ -33,17 +33,20 @@ aggregate: clean-test-results $(T)
 	@echo "*** $@ ***"
 	lib/test-aggregate-results.sh
 
-deps: $(SHARNESS) $(BINS) curl
+global-deps:
+	$(MAKE) -C ../.. deps
+
+deps: global-deps $(SHARNESS) $(BINS) curl
 
 $(SHARNESS): FORCE
 	@echo "*** checking $@ ***"
 	lib/install-sharness.sh
 
 bin/%: FORCE
-	cd .. && make GOFLAGS=$(GOFLAGS) $@
+	$(MAKE) -C .. GOFLAGS=$(GOFLAGS) $@
 
 race:
-	make GOFLAGS=-race all
+	$(MAKE) GOFLAGS=-race all
 
 .PHONY: all clean $(T) aggregate FORCE
 

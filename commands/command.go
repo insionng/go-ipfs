@@ -13,12 +13,12 @@ import (
 	"fmt"
 	"io"
 	"reflect"
-	"strings"
 
-	u "github.com/ipfs/go-ipfs/util"
+	"github.com/ipfs/go-ipfs/path"
+	logging "gx/ipfs/QmSpJByNKFX1sCsHBEp3R73FL4NF6FnQTEGyNAXHm2GS52/go-log"
 )
 
-var log = u.Logger("command")
+var log = logging.Logger("command")
 
 // Function is the type of function that Commands use.
 // It reads from the Request, and writes results to the Response.
@@ -36,9 +36,9 @@ type MarshalerMap map[EncodingType]Marshaler
 // text follows formats similar to man pages, but not exactly the same.
 type HelpText struct {
 	// required
-	Tagline          string // used in <cmd usage>
-	ShortDescription string // used in DESCRIPTION
-	Synopsis         string // showcasing the cmd
+	Tagline               string            // used in <cmd usage>
+	ShortDescription      string            // used in DESCRIPTION
+	SynopsisOptionsValues map[string]string // mappings for synopsis generator
 
 	// optional - whole section overrides
 	Usage           string // overrides USAGE section
@@ -46,18 +46,28 @@ type HelpText struct {
 	Options         string // overrides OPTIONS section
 	Arguments       string // overrides ARGUMENTS section
 	Subcommands     string // overrides SUBCOMMANDS section
+	Synopsis        string // overrides SYNOPSIS field
 }
 
 // Command is a runnable command, with input arguments and options (flags).
 // It can also have Subcommands, to group units of work into sets.
 type Command struct {
-	Options    []Option
-	Arguments  []Argument
-	PreRun     func(req Request) error
+	Options   []Option
+	Arguments []Argument
+	PreRun    func(req Request) error
+
+	// Run is the function that processes the request to generate a response.
+	// Note that when executing the command over the HTTP API you can only read
+	// after writing when using multipart requests. The request body will not be
+	// available for reading after the HTTP connection has been written to.
 	Run        Function
 	PostRun    Function
 	Marshalers map[EncodingType]Marshaler
 	Helptext   HelpText
+
+	// External denotes that a command is actually an external binary.
+	// fewer checks and validations will be performed on such commands.
+	External bool
 
 	// Type describes the type of the output of the Command's Run Function.
 	// In precise terms, the value of Type is an instance of the return type of
@@ -129,7 +139,8 @@ func (c *Command) Call(req Request) Response {
 		}
 	}
 
-	// If the command specified an output type, ensure the actual value returned is of that type
+	// If the command specified an output type, ensure the actual value
+	// returned is of that type
 	if cmd.Type != nil && !isChan {
 		expectedType := reflect.TypeOf(cmd.Type)
 
@@ -142,17 +153,17 @@ func (c *Command) Call(req Request) Response {
 	return res
 }
 
-// Resolve gets the subcommands at the given path
-func (c *Command) Resolve(path []string) ([]*Command, error) {
-	cmds := make([]*Command, len(path)+1)
+// Resolve returns the subcommands at the given path
+func (c *Command) Resolve(pth []string) ([]*Command, error) {
+	cmds := make([]*Command, len(pth)+1)
 	cmds[0] = c
 
 	cmd := c
-	for i, name := range path {
+	for i, name := range pth {
 		cmd = cmd.Subcommand(name)
 
 		if cmd == nil {
-			pathS := strings.Join(path[0:i], "/")
+			pathS := path.Join(pth[:i])
 			return nil, fmt.Errorf("Undefined command: '%s'", pathS)
 		}
 
@@ -171,7 +182,7 @@ func (c *Command) Get(path []string) (*Command, error) {
 	return cmds[len(cmds)-1], nil
 }
 
-// GetOptions gets the options in the given path of commands
+// GetOptions returns the options in the given path of commands
 func (c *Command) GetOptions(path []string) (map[string]Option, error) {
 	options := make([]Option, 0, len(c.Options))
 
@@ -200,7 +211,7 @@ func (c *Command) GetOptions(path []string) (map[string]Option, error) {
 }
 
 func (c *Command) CheckArguments(req Request) error {
-	args := req.Arguments()
+	args := req.(*request).arguments
 
 	// count required argument definitions
 	numRequired := 0
@@ -212,18 +223,26 @@ func (c *Command) CheckArguments(req Request) error {
 
 	// iterate over the arg definitions
 	valueIndex := 0 // the index of the current value (in `args`)
-	for _, argDef := range c.Arguments {
-		// skip optional argument definitions if there aren't sufficient remaining values
-		if len(args)-valueIndex <= numRequired && !argDef.Required || argDef.Type == ArgFile {
+	for i, argDef := range c.Arguments {
+		// skip optional argument definitions if there aren't
+		// sufficient remaining values
+		if len(args)-valueIndex <= numRequired && !argDef.Required ||
+			argDef.Type == ArgFile {
 			continue
 		}
 
-		// the value for this argument definition. can be nil if it wasn't provided by the caller
+		// the value for this argument definition. can be nil if it
+		// wasn't provided by the caller
 		v, found := "", false
 		if valueIndex < len(args) {
 			v = args[valueIndex]
 			found = true
 			valueIndex++
+		}
+
+		// in the case of a non-variadic required argument that supports stdin
+		if !found && len(c.Arguments)-1 == i && argDef.SupportsStdin {
+			found = true
 		}
 
 		err := checkArgValue(v, found, argDef)
@@ -250,8 +269,32 @@ func (c *Command) Subcommand(id string) *Command {
 	return c.Subcommands[id]
 }
 
-// checkArgValue returns an error if a given arg value is not valid for the given Argument
+type CommandVisitor func(*Command)
+
+// Walks tree of all subcommands (including this one)
+func (c *Command) Walk(visitor CommandVisitor) {
+	visitor(c)
+	for _, cm := range c.Subcommands {
+		cm.Walk(visitor)
+	}
+}
+
+func (c *Command) ProcessHelp() {
+	c.Walk(func(cm *Command) {
+		ht := &cm.Helptext
+		if len(ht.LongDescription) == 0 {
+			ht.LongDescription = ht.ShortDescription
+		}
+	})
+}
+
+// checkArgValue returns an error if a given arg value is not valid for the
+// given Argument
 func checkArgValue(v string, found bool, def Argument) error {
+	if def.Variadic && def.SupportsStdin {
+		return nil
+	}
+
 	if !found && def.Required {
 		return fmt.Errorf("Argument '%s' is required", def.Name)
 	}

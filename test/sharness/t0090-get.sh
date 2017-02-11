@@ -10,6 +10,28 @@ test_description="Test get command"
 
 test_init_ipfs
 
+test_ipfs_get_flag() {
+    ext="$1"; shift
+    tar_flag="$1"; shift
+    flag="$@"
+
+    test_expect_success "ipfs get $flag succeeds" '
+        ipfs get "$HASH" '"$flag"' >actual
+    '
+
+    test_expect_success "ipfs get $flag output looks good" '
+		printf "%s\n\n" "Saving archive to $HASH$ext" >expected &&
+		test_cmp expected actual
+	'
+
+    test_expect_success "ipfs get $flag archive output is valid" '
+		tar "$tar_flag" "$HASH$ext" &&
+		test_cmp "$HASH" data &&
+		rm "$HASH$ext" &&
+		rm "$HASH"
+	'
+}
+
 # we use a function so that we can run it both offline + online
 test_get_cmd() {
 
@@ -42,39 +64,11 @@ test_get_cmd() {
 		rm "$HASH"
 	'
 
-	test_expect_success "ipfs get -a succeeds" '
-		ipfs get "$HASH" -a >actual
-	'
+    test_ipfs_get_flag ".tar" "-xf" -a
 
-	test_expect_success "ipfs get -a output looks good" '
-		printf "%s\n\n" "Saving archive to $HASH.tar" >expected &&
-		test_cmp expected actual
-	'
+    test_ipfs_get_flag ".tar.gz" "-zxf" -a -C
 
-	# TODO: determine why this fails
-	test_expect_failure "ipfs get -a archive output is valid" '
-		tar -xf "$HASH".tar &&
-		test_cmp "$HASH" data &&
-		rm "$HASH".tar &&
-		rm "$HASH"
-	'
-
-	test_expect_success "ipfs get -a -C succeeds" '
-		ipfs get "$HASH" -a -C >actual
-	'
-
-	test_expect_success "ipfs get -a -C output looks good" '
-		printf "%s\n\n" "Saving archive to $HASH.tar.gz" >expected &&
-		test_cmp expected actual
-	'
-
-	# TODO(mappum)
-	test_expect_failure "gzipped tar archive output is valid" '
-		tar -zxf "$HASH".tar.gz &&
-		test_cmp "$HASH" data &&
-		rm "$HASH".tar.gz &&
-		rm "$HASH"
-	'
+    test_ipfs_get_flag ".tar.gz" "-zxf" -a -C -l 9
 
 	test_expect_success "ipfs get succeeds (directory)" '
 		mkdir -p dir &&
@@ -105,8 +99,7 @@ test_get_cmd() {
 		test_cmp expected actual
 	'
 
-	# TODO(mappum)
-	test_expect_failure "gzipped tar archive output is valid (directory)" '
+	test_expect_success "gzipped tar archive output is valid (directory)" '
 		tar -zxf "$HASH2".tar.gz &&
 		test_cmp dir/a "$HASH2"/a &&
 		test_cmp dir/b/c "$HASH2"/b/c &&
@@ -114,14 +107,35 @@ test_get_cmd() {
 	'
 
 	test_expect_success "ipfs get ../.. should fail" '
-		echo "Error: invalid ipfs ref path" >expected &&
+		echo "Error: invalid 'ipfs ref' path" >expected &&
 		test_must_fail ipfs get ../.. 2>actual &&
 		test_cmp expected actual
 	'
 }
 
+test_get_fail() {
+	test_expect_success "create an object that has unresolveable links" '
+		cat <<-\EOF >bad_object &&
+{ "Links": [ { "Name": "foo", "Hash": "QmZzaC6ydNXiR65W8VjGA73ET9MZ6VFAqUT1ngYMXcpihn", "Size": 1897 }, { "Name": "bar", "Hash": "Qmd4mG6pDFDmDTn6p3hX1srP8qTbkyXKj5yjpEsiHDX3u8", "Size": 56 }, { "Name": "baz", "Hash": "QmUTjwRnG28dSrFFVTYgbr6LiDLsBmRr2SaUSTGheK2YqG", "Size": 24266 } ], "Data": "\b\u0001" }
+		EOF
+		cat bad_object | ipfs object put > put_out
+	'
+
+	test_expect_success "output looks good" '
+		echo "added QmaGidyrnX8FMbWJoxp8HVwZ1uRKwCyxBJzABnR1S2FVUr" > put_exp &&
+		test_cmp put_exp put_out
+	'
+
+	test_expect_success "ipfs get fails" '
+		test_expect_code 1 ipfs get QmaGidyrnX8FMbWJoxp8HVwZ1uRKwCyxBJzABnR1S2FVUr 
+	'
+}
+
 # should work offline
 test_get_cmd
+
+# only really works offline, will try and search network when online
+test_get_fail
 
 # should work online
 test_launch_ipfs_daemon

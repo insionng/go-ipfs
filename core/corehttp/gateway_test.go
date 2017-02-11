@@ -1,22 +1,26 @@
 package corehttp
 
 import (
+	"context"
 	"errors"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
 	core "github.com/ipfs/go-ipfs/core"
 	coreunix "github.com/ipfs/go-ipfs/core/coreunix"
+	dag "github.com/ipfs/go-ipfs/merkledag"
 	namesys "github.com/ipfs/go-ipfs/namesys"
-	ci "github.com/ipfs/go-ipfs/p2p/crypto"
 	path "github.com/ipfs/go-ipfs/path"
 	repo "github.com/ipfs/go-ipfs/repo"
 	config "github.com/ipfs/go-ipfs/repo/config"
-	testutil "github.com/ipfs/go-ipfs/util/testutil"
+	testutil "github.com/ipfs/go-ipfs/thirdparty/testutil"
+
+	id "gx/ipfs/QmdzDdLZ7nj133QvNHypyS9Y39g35bMFk5DJ2pmX7YqtKU/go-libp2p/p2p/protocol/identify"
+	ci "gx/ipfs/QmfWDLQjGjVe4fr5CoztYW2DYYjRysMJrFe1RCsXLPTf46/go-libp2p-crypto"
 )
 
 type mockNamesys map[string]path.Path
@@ -34,6 +38,10 @@ func (m mockNamesys) ResolveN(ctx context.Context, name string, depth int) (valu
 }
 
 func (m mockNamesys) Publish(ctx context.Context, name ci.PrivKey, value path.Path) error {
+	return errors.New("not implemented for mockNamesys")
+}
+
+func (m mockNamesys) PublishWithEOL(ctx context.Context, name ci.PrivKey, value path.Path, _ time.Time) error {
 	return errors.New("not implemented for mockNamesys")
 }
 
@@ -83,6 +91,12 @@ func newTestServerAndNode(t *testing.T, ns mockNamesys) (*httptest.Server, *core
 		t.Fatal(err)
 	}
 
+	cfg, err := n.Repo.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Gateway.PathPrefixes = []string{"/good-prefix"}
+
 	// need this variable here since we need to construct handler with
 	// listener, and server with handler. yay cycles.
 	dh := &delegatedHandler{}
@@ -90,8 +104,9 @@ func newTestServerAndNode(t *testing.T, ns mockNamesys) (*httptest.Server, *core
 
 	dh.Handler, err = makeHandler(n,
 		ts.Listener,
+		VersionOption(),
 		IPNSHostnameOption(),
-		GatewayOption(false),
+		GatewayOption(false, "/ipfs", "/ipns"),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -121,7 +136,7 @@ func TestGatewayGet(t *testing.T) {
 		{"localhost:5001", "/", http.StatusNotFound, "404 page not found\n"},
 		{"localhost:5001", "/" + k, http.StatusNotFound, "404 page not found\n"},
 		{"localhost:5001", "/ipfs/" + k, http.StatusOK, "fnord"},
-		{"localhost:5001", "/ipns/nxdomain.example.com", http.StatusBadRequest, "Path Resolve error: " + namesys.ErrResolveFailed.Error()},
+		{"localhost:5001", "/ipns/nxdomain.example.com", http.StatusInternalServerError, "Path Resolve error: " + namesys.ErrResolveFailed.Error()},
 		{"localhost:5001", "/ipns/example.com", http.StatusOK, "fnord"},
 		{"example.com", "/", http.StatusOK, "fnord"},
 	} {
@@ -165,24 +180,28 @@ func TestIPNSHostnameRedirect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	_, dagn2, err := coreunix.AddWrapped(n, strings.NewReader("_"), "index.html")
 	if err != nil {
 		t.Fatal(err)
 	}
-	dagn1.AddNodeLink("foo", dagn2)
+
+	dagn1.(*dag.ProtoNode).AddNodeLink("foo", dagn2)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = n.DAG.AddRecursive(dagn1)
+	_, err = n.DAG.Add(dagn2)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	k, err := dagn1.Key()
+	_, err = n.DAG.Add(dagn1)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	k := dagn1.Cid()
 	t.Logf("k: %s\n", k)
 	ns["/ipns/example.net"] = path.FromString("/ipfs/" + k.String())
 
@@ -208,6 +227,30 @@ func TestIPNSHostnameRedirect(t *testing.T) {
 	} else if hdr[0] != "/foo/" {
 		t.Errorf("location header is %v, expected /foo/", hdr[0])
 	}
+
+	// make request with prefix to directory containing index.html
+	req, err = http.NewRequest("GET", ts.URL+"/foo", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "example.net"
+	req.Header.Set("X-Ipfs-Gateway-Prefix", "/good-prefix")
+
+	res, err = doWithoutRedirect(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// expect 302 redirect to same path, but with prefix and trailing slash
+	if res.StatusCode != 302 {
+		t.Errorf("status is %d, expected 302", res.StatusCode)
+	}
+	hdr = res.Header["Location"]
+	if len(hdr) < 1 {
+		t.Errorf("location header not present")
+	} else if hdr[0] != "/good-prefix/foo/" {
+		t.Errorf("location header is %v, expected /good-prefix/foo/", hdr[0])
+	}
 }
 
 func TestIPNSHostnameBacklinks(t *testing.T) {
@@ -229,26 +272,31 @@ func TestIPNSHostnameBacklinks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dagn2.AddNodeLink("bar", dagn3)
-	dagn1.AddNodeLink("foo", dagn2)
+	dagn2.(*dag.ProtoNode).AddNodeLink("bar", dagn3)
+	dagn1.(*dag.ProtoNode).AddNodeLink("foo? #<'", dagn2)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = n.DAG.AddRecursive(dagn1)
+	_, err = n.DAG.Add(dagn3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = n.DAG.Add(dagn2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = n.DAG.Add(dagn1)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	k, err := dagn1.Key()
-	if err != nil {
-		t.Fatal(err)
-	}
+	k := dagn1.Cid()
 	t.Logf("k: %s\n", k)
 	ns["/ipns/example.net"] = path.FromString("/ipfs/" + k.String())
 
 	// make request to directory listing
-	req, err := http.NewRequest("GET", ts.URL+"/foo/", nil)
+	req, err := http.NewRequest("GET", ts.URL+"/foo%3F%20%23%3C%27/", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,17 +315,17 @@ func TestIPNSHostnameBacklinks(t *testing.T) {
 	s := string(body)
 	t.Logf("body: %s\n", string(body))
 
-	if !strings.Contains(s, "Index of /foo/") {
+	if !strings.Contains(s, "Index of /foo? #&lt;&#39;/") {
 		t.Fatalf("expected a path in directory listing")
 	}
 	if !strings.Contains(s, "<a href=\"/\">") {
 		t.Fatalf("expected backlink in directory listing")
 	}
-	if !strings.Contains(s, "<a href=\"/foo/file.txt\">") {
+	if !strings.Contains(s, "<a href=\"/foo%3F%20%23%3C%27/file.txt\">") {
 		t.Fatalf("expected file in directory listing")
 	}
 
-	// make request to directory listing
+	// make request to directory listing at root
 	req, err = http.NewRequest("GET", ts.URL, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -289,7 +337,7 @@ func TestIPNSHostnameBacklinks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// expect correct backlinks
+	// expect correct backlinks at root
 	body, err = ioutil.ReadAll(res.Body)
 	if err != nil {
 		t.Fatalf("error reading response: %s", err)
@@ -308,7 +356,7 @@ func TestIPNSHostnameBacklinks(t *testing.T) {
 	}
 
 	// make request to directory listing
-	req, err = http.NewRequest("GET", ts.URL+"/foo/bar/", nil)
+	req, err = http.NewRequest("GET", ts.URL+"/foo%3F%20%23%3C%27/bar/", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,13 +375,124 @@ func TestIPNSHostnameBacklinks(t *testing.T) {
 	s = string(body)
 	t.Logf("body: %s\n", string(body))
 
-	if !strings.Contains(s, "Index of /foo/bar/") {
+	if !strings.Contains(s, "Index of /foo? #&lt;&#39;/bar/") {
 		t.Fatalf("expected a path in directory listing")
 	}
-	if !strings.Contains(s, "<a href=\"/foo/\">") {
+	if !strings.Contains(s, "<a href=\"/foo%3F%20%23%3C%27/\">") {
 		t.Fatalf("expected backlink in directory listing")
 	}
-	if !strings.Contains(s, "<a href=\"/foo/bar/file.txt\">") {
+	if !strings.Contains(s, "<a href=\"/foo%3F%20%23%3C%27/bar/file.txt\">") {
 		t.Fatalf("expected file in directory listing")
+	}
+
+	// make request to directory listing with prefix
+	req, err = http.NewRequest("GET", ts.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "example.net"
+	req.Header.Set("X-Ipfs-Gateway-Prefix", "/good-prefix")
+
+	res, err = doWithoutRedirect(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// expect correct backlinks with prefix
+	body, err = ioutil.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("error reading response: %s", err)
+	}
+	s = string(body)
+	t.Logf("body: %s\n", string(body))
+
+	if !strings.Contains(s, "Index of /good-prefix") {
+		t.Fatalf("expected a path in directory listing")
+	}
+	if !strings.Contains(s, "<a href=\"/good-prefix/\">") {
+		t.Fatalf("expected backlink in directory listing")
+	}
+	if !strings.Contains(s, "<a href=\"/good-prefix/file.txt\">") {
+		t.Fatalf("expected file in directory listing")
+	}
+
+	// make request to directory listing with illegal prefix
+	req, err = http.NewRequest("GET", ts.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "example.net"
+	req.Header.Set("X-Ipfs-Gateway-Prefix", "/bad-prefix")
+
+	res, err = doWithoutRedirect(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// make request to directory listing with evil prefix
+	req, err = http.NewRequest("GET", ts.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "example.net"
+	req.Header.Set("X-Ipfs-Gateway-Prefix", "//good-prefix/foo")
+
+	res, err = doWithoutRedirect(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// expect correct backlinks without illegal prefix
+	body, err = ioutil.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("error reading response: %s", err)
+	}
+	s = string(body)
+	t.Logf("body: %s\n", string(body))
+
+	if !strings.Contains(s, "Index of /") {
+		t.Fatalf("expected a path in directory listing")
+	}
+	if !strings.Contains(s, "<a href=\"/\">") {
+		t.Fatalf("expected backlink in directory listing")
+	}
+	if !strings.Contains(s, "<a href=\"/file.txt\">") {
+		t.Fatalf("expected file in directory listing")
+	}
+}
+
+func TestVersion(t *testing.T) {
+	config.CurrentCommit = "theshortcommithash"
+
+	ns := mockNamesys{}
+	ts, _ := newTestServerAndNode(t, ns)
+	t.Logf("test server url: %s", ts.URL)
+	defer ts.Close()
+
+	req, err := http.NewRequest("GET", ts.URL+"/version", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := doWithoutRedirect(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("error reading response: %s", err)
+	}
+	s := string(body)
+
+	if !strings.Contains(s, "Commit: theshortcommithash") {
+		t.Fatalf("response doesn't contain commit:\n%s", s)
+	}
+
+	if !strings.Contains(s, "Client Version: "+id.ClientVersion) {
+		t.Fatalf("response doesn't contain client version:\n%s", s)
+	}
+
+	if !strings.Contains(s, "Protocol Version: "+id.LibP2PVersion) {
+		t.Fatalf("response doesn't contain protocol version:\n%s", s)
 	}
 }

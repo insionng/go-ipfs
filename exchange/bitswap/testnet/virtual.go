@@ -1,17 +1,17 @@
 package bitswap
 
 import (
+	"context"
 	"errors"
 
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
-	key "github.com/ipfs/go-ipfs/blocks/key"
 	bsmsg "github.com/ipfs/go-ipfs/exchange/bitswap/message"
 	bsnet "github.com/ipfs/go-ipfs/exchange/bitswap/network"
-	peer "github.com/ipfs/go-ipfs/p2p/peer"
-	routing "github.com/ipfs/go-ipfs/routing"
 	mockrouting "github.com/ipfs/go-ipfs/routing/mock"
 	delay "github.com/ipfs/go-ipfs/thirdparty/delay"
-	testutil "github.com/ipfs/go-ipfs/util/testutil"
+	testutil "github.com/ipfs/go-ipfs/thirdparty/testutil"
+	routing "gx/ipfs/QmbkGVaN9W6RYJK4Ws5FvMKXKDqdRQ5snhtaa92qP6L8eU/go-libp2p-routing"
+	cid "gx/ipfs/QmcTcsTvfaeEBRFo1TkFgT8sRmgi1n1LTZpecfVP8fzpGD/go-cid"
+	peer "gx/ipfs/QmfMmLGoKzCHDN7cGgk64PJr4iipzidDRME8HABSJqvmhC/go-libp2p-peer"
 )
 
 func VirtualNetwork(rs mockrouting.Server, d delay.D) Network {
@@ -91,7 +91,7 @@ func (nc *networkClient) SendMessage(
 }
 
 // FindProvidersAsync returns a channel of providers for the given key
-func (nc *networkClient) FindProvidersAsync(ctx context.Context, k key.Key, max int) <-chan peer.ID {
+func (nc *networkClient) FindProvidersAsync(ctx context.Context, k *cid.Cid, max int) <-chan peer.ID {
 
 	// NB: this function duplicates the PeerInfo -> ID transformation in the
 	// bitswap network adapter. Not to worry. This network client will be
@@ -112,8 +112,32 @@ func (nc *networkClient) FindProvidersAsync(ctx context.Context, k key.Key, max 
 	return out
 }
 
+type messagePasser struct {
+	net    *network
+	target peer.ID
+	local  peer.ID
+	ctx    context.Context
+}
+
+func (mp *messagePasser) SendMsg(ctx context.Context, m bsmsg.BitSwapMessage) error {
+	return mp.net.SendMessage(ctx, mp.local, mp.target, m)
+}
+
+func (mp *messagePasser) Close() error {
+	return nil
+}
+
+func (n *networkClient) NewMessageSender(ctx context.Context, p peer.ID) (bsnet.MessageSender, error) {
+	return &messagePasser{
+		net:    n.network,
+		target: p,
+		local:  n.local,
+		ctx:    ctx,
+	}, nil
+}
+
 // Provide provides the key to the network
-func (nc *networkClient) Provide(ctx context.Context, k key.Key) error {
+func (nc *networkClient) Provide(ctx context.Context, k *cid.Cid) error {
 	return nc.routing.Provide(ctx, k)
 }
 

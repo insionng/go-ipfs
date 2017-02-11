@@ -1,23 +1,23 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 
-	ggio "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/gogo/protobuf/io"
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
-
-	key "github.com/ipfs/go-ipfs/blocks/key"
-	host "github.com/ipfs/go-ipfs/p2p/host"
-	inet "github.com/ipfs/go-ipfs/p2p/net"
-	peer "github.com/ipfs/go-ipfs/p2p/peer"
-	dhtpb "github.com/ipfs/go-ipfs/routing/dht/pb"
-	kbucket "github.com/ipfs/go-ipfs/routing/kbucket"
-	eventlog "github.com/ipfs/go-ipfs/thirdparty/eventlog"
+	host "gx/ipfs/QmPsRtodRuBUir32nz5v4zuSBTSszrR1d3fA6Ahb6eaejj/go-libp2p-host"
+	inet "gx/ipfs/QmQx1dHDDYENugYgqA22BaBrRfuv1coSsuPiM7rYh1wwGH/go-libp2p-net"
+	dhtpb "gx/ipfs/QmRG9fdibExi5DFy8kzyxF76jvZVUb2mQBUSMNP1YaYn9M/go-libp2p-kad-dht/pb"
+	kbucket "gx/ipfs/QmRVHVr38ChANF2PUMNKQs7Q4uVWCLVabrfcTG9taNbcVy/go-libp2p-kbucket"
+	logging "gx/ipfs/QmSpJByNKFX1sCsHBEp3R73FL4NF6FnQTEGyNAXHm2GS52/go-log"
+	loggables "gx/ipfs/QmTMy4hVSY28DdwJ9kBz6y7q6MuioFzPcpM3Ma3aPjo1i3/go-libp2p-loggables"
+	ggio "gx/ipfs/QmZ4Qi3GaRbjcx28Sme5eMH7RQjGkt8wHxt2a65oLaeFEV/gogo-protobuf/io"
+	pstore "gx/ipfs/QmeXj9VAjmYQZxpmVz7VzccbJrpmr8qkCDSjfVNsPTWTYU/go-libp2p-peerstore"
+	peer "gx/ipfs/QmfMmLGoKzCHDN7cGgk64PJr4iipzidDRME8HABSJqvmhC/go-libp2p-peer"
 )
 
 const ProtocolSNR = "/ipfs/supernoderouting"
 
-var log = eventlog.Logger("supernode/proxy")
+var log = logging.Logger("supernode/proxy")
 
 type Proxy interface {
 	Bootstrap(context.Context) error
@@ -29,11 +29,11 @@ type Proxy interface {
 type standard struct {
 	Host host.Host
 
-	remoteInfos []peer.PeerInfo // addr required for bootstrapping
-	remoteIDs   []peer.ID       // []ID is required for each req. here, cached for performance.
+	remoteInfos []pstore.PeerInfo // addr required for bootstrapping
+	remoteIDs   []peer.ID         // []ID is required for each req. here, cached for performance.
 }
 
-func Standard(h host.Host, remotes []peer.PeerInfo) Proxy {
+func Standard(h host.Host, remotes []pstore.PeerInfo) Proxy {
 	var ids []peer.ID
 	for _, remote := range remotes {
 		ids = append(ids, remote.ID)
@@ -42,7 +42,7 @@ func Standard(h host.Host, remotes []peer.PeerInfo) Proxy {
 }
 
 func (px *standard) Bootstrap(ctx context.Context) error {
-	var cxns []peer.PeerInfo
+	var cxns []pstore.PeerInfo
 	for _, info := range px.remoteInfos {
 		if err := px.Host.Connect(ctx, info); err != nil {
 			continue
@@ -95,10 +95,10 @@ func (px *standard) sendMessage(ctx context.Context, m *dhtpb.Message, remote pe
 		}
 		e.Done()
 	}()
-	if err = px.Host.Connect(ctx, peer.PeerInfo{ID: remote}); err != nil {
+	if err = px.Host.Connect(ctx, pstore.PeerInfo{ID: remote}); err != nil {
 		return err
 	}
-	s, err := px.Host.NewStream(ProtocolSNR, remote)
+	s, err := px.Host.NewStream(ctx, remote, ProtocolSNR)
 	if err != nil {
 		return err
 	}
@@ -127,13 +127,13 @@ func (px *standard) SendRequest(ctx context.Context, m *dhtpb.Message) (*dhtpb.M
 }
 
 func (px *standard) sendRequest(ctx context.Context, m *dhtpb.Message, remote peer.ID) (*dhtpb.Message, error) {
-	e := log.EventBegin(ctx, "sendRoutingRequest", px.Host.ID(), remote, eventlog.Pair("request", m))
+	e := log.EventBegin(ctx, "sendRoutingRequest", px.Host.ID(), remote, logging.Pair("request", m))
 	defer e.Done()
-	if err := px.Host.Connect(ctx, peer.PeerInfo{ID: remote}); err != nil {
+	if err := px.Host.Connect(ctx, pstore.PeerInfo{ID: remote}); err != nil {
 		e.SetError(err)
 		return nil, err
 	}
-	s, err := px.Host.NewStream(ProtocolSNR, remote)
+	s, err := px.Host.NewStream(ctx, remote, ProtocolSNR)
 	if err != nil {
 		e.SetError(err)
 		return nil, err
@@ -157,12 +157,12 @@ func (px *standard) sendRequest(ctx context.Context, m *dhtpb.Message, remote pe
 		e.SetError(err)
 		return nil, err
 	}
-	e.Append(eventlog.Pair("response", response))
-	e.Append(eventlog.Pair("uuid", eventlog.Uuid("foo")))
+	e.Append(logging.Pair("response", response))
+	e.Append(logging.Pair("uuid", loggables.Uuid("foo")))
 	return response, nil
 }
 
 func sortedByKey(peers []peer.ID, skey string) []peer.ID {
-	target := kbucket.ConvertKey(key.Key(skey))
+	target := kbucket.ConvertKey(skey)
 	return kbucket.SortClosestPeers(peers, target)
 }

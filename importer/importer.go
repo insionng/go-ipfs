@@ -1,4 +1,4 @@
-// package importer implements utilities used to create ipfs DAGs from files
+// package importer implements utilities used to create IPFS DAGs from files
 // and readers
 package importer
 
@@ -12,15 +12,16 @@ import (
 	h "github.com/ipfs/go-ipfs/importer/helpers"
 	trickle "github.com/ipfs/go-ipfs/importer/trickle"
 	dag "github.com/ipfs/go-ipfs/merkledag"
-	"github.com/ipfs/go-ipfs/pin"
-	u "github.com/ipfs/go-ipfs/util"
+
+	node "gx/ipfs/QmRSU5EqqWVZSNdbU51yXmVoF1uNw3JgTNB6RaiL7DZM16/go-ipld-node"
+	logging "gx/ipfs/QmSpJByNKFX1sCsHBEp3R73FL4NF6FnQTEGyNAXHm2GS52/go-log"
 )
 
-var log = u.Logger("importer")
+var log = logging.Logger("importer")
 
 // Builds a DAG from the given file, writing created blocks to disk as they are
 // created
-func BuildDagFromFile(fpath string, ds dag.DAGService, mp pin.ManualPinner) (*dag.Node, error) {
+func BuildDagFromFile(fpath string, ds dag.DAGService) (node.Node, error) {
 	stat, err := os.Lstat(fpath)
 	if err != nil {
 		return nil, err
@@ -30,66 +31,29 @@ func BuildDagFromFile(fpath string, ds dag.DAGService, mp pin.ManualPinner) (*da
 		return nil, fmt.Errorf("`%s` is a directory", fpath)
 	}
 
-	f, err := files.NewSerialFile(fpath, fpath, stat)
+	f, err := files.NewSerialFile(fpath, fpath, false, stat)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	return BuildDagFromReader(ds, chunk.NewSizeSplitter(f, chunk.DefaultBlockSize), BasicPinnerCB(mp))
+	return BuildDagFromReader(ds, chunk.NewSizeSplitter(f, chunk.DefaultBlockSize))
 }
 
-func BuildDagFromReader(ds dag.DAGService, spl chunk.Splitter, ncb h.NodeCB) (*dag.Node, error) {
-	// Start the splitter
-	blkch, errch := chunk.Chan(spl)
-
+func BuildDagFromReader(ds dag.DAGService, spl chunk.Splitter) (node.Node, error) {
 	dbp := h.DagBuilderParams{
 		Dagserv:  ds,
 		Maxlinks: h.DefaultLinksPerBlock,
-		NodeCB:   ncb,
 	}
 
-	return bal.BalancedLayout(dbp.New(blkch, errch))
+	return bal.BalancedLayout(dbp.New(spl))
 }
 
-func BuildTrickleDagFromReader(ds dag.DAGService, spl chunk.Splitter, ncb h.NodeCB) (*dag.Node, error) {
-	// Start the splitter
-	blkch, errch := chunk.Chan(spl)
-
+func BuildTrickleDagFromReader(ds dag.DAGService, spl chunk.Splitter) (node.Node, error) {
 	dbp := h.DagBuilderParams{
 		Dagserv:  ds,
 		Maxlinks: h.DefaultLinksPerBlock,
-		NodeCB:   ncb,
 	}
 
-	return trickle.TrickleLayout(dbp.New(blkch, errch))
-}
-
-func BasicPinnerCB(p pin.ManualPinner) h.NodeCB {
-	return func(n *dag.Node, last bool) error {
-		k, err := n.Key()
-		if err != nil {
-			return err
-		}
-
-		if last {
-			p.PinWithMode(k, pin.Recursive)
-			return p.Flush()
-		} else {
-			p.PinWithMode(k, pin.Indirect)
-			return nil
-		}
-	}
-}
-
-func PinIndirectCB(p pin.ManualPinner) h.NodeCB {
-	return func(n *dag.Node, last bool) error {
-		k, err := n.Key()
-		if err != nil {
-			return err
-		}
-
-		p.PinWithMode(k, pin.Indirect)
-		return nil
-	}
+	return trickle.TrickleLayout(dbp.New(spl))
 }

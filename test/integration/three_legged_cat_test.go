@@ -8,15 +8,15 @@ import (
 	"testing"
 	"time"
 
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
+	context "context"
 
 	core "github.com/ipfs/go-ipfs/core"
 	coreunix "github.com/ipfs/go-ipfs/core/coreunix"
 	mock "github.com/ipfs/go-ipfs/core/mock"
-	mocknet "github.com/ipfs/go-ipfs/p2p/net/mock"
-	"github.com/ipfs/go-ipfs/p2p/peer"
+	testutil "github.com/ipfs/go-ipfs/thirdparty/testutil"
 	"github.com/ipfs/go-ipfs/thirdparty/unit"
-	testutil "github.com/ipfs/go-ipfs/util/testutil"
+	mocknet "gx/ipfs/QmdzDdLZ7nj133QvNHypyS9Y39g35bMFk5DJ2pmX7YqtKU/go-libp2p/p2p/net/mock"
+	pstore "gx/ipfs/QmeXj9VAjmYQZxpmVz7VzccbJrpmr8qkCDSjfVNsPTWTYU/go-libp2p-peerstore"
 )
 
 func TestThreeLeggedCatTransfer(t *testing.T) {
@@ -104,7 +104,7 @@ func RunThreeLeggedCat(data []byte, conf testutil.LatencyConfig) error {
 	mn.LinkAll()
 
 	bis := bootstrap.Peerstore.PeerInfo(bootstrap.PeerHost.ID())
-	bcfg := core.BootstrapConfigWithPeers([]peer.PeerInfo{bis})
+	bcfg := core.BootstrapConfigWithPeers([]pstore.PeerInfo{bis})
 	if err := adder.Bootstrap(bcfg); err != nil {
 		return err
 	}
@@ -117,7 +117,7 @@ func RunThreeLeggedCat(data []byte, conf testutil.LatencyConfig) error {
 		return err
 	}
 
-	readerCatted, err := coreunix.Cat(catter, added)
+	readerCatted, err := coreunix.Cat(ctx, catter, added)
 	if err != nil {
 		return err
 	}
@@ -128,5 +128,6 @@ func RunThreeLeggedCat(data []byte, conf testutil.LatencyConfig) error {
 	if 0 != bytes.Compare(bufout.Bytes(), data) {
 		return errors.New("catted data does not match added data")
 	}
+	cancel()
 	return nil
 }

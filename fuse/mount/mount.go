@@ -8,12 +8,11 @@ import (
 	"runtime"
 	"time"
 
-	goprocess "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/goprocess"
-
-	u "github.com/ipfs/go-ipfs/util"
+	goprocess "gx/ipfs/QmSF8fPo3jgVBAy8fpdjjYqgG87dkJgUprRBHRd2tmfgpP/goprocess"
+	logging "gx/ipfs/QmSpJByNKFX1sCsHBEp3R73FL4NF6FnQTEGyNAXHm2GS52/go-log"
 )
 
-var log = u.Logger("mount")
+var log = logging.Logger("mount")
 
 var MountTimeout = time.Second * 5
 
@@ -24,6 +23,9 @@ type Mount interface {
 
 	// Unmounts the mount
 	Unmount() error
+
+	// Checks if the mount is still active.
+	IsActive() bool
 
 	// Process returns the mount's Process to be able to link it
 	// to other processes. Unmount upon closing.

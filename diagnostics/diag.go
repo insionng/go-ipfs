@@ -11,22 +11,23 @@ import (
 	"sync"
 	"time"
 
-	ggio "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/gogo/protobuf/io"
-	proto "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/gogo/protobuf/proto"
-	ctxio "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-context/io"
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
+	context "context"
 	pb "github.com/ipfs/go-ipfs/diagnostics/pb"
-	host "github.com/ipfs/go-ipfs/p2p/host"
-	inet "github.com/ipfs/go-ipfs/p2p/net"
-	peer "github.com/ipfs/go-ipfs/p2p/peer"
-	protocol "github.com/ipfs/go-ipfs/p2p/protocol"
-	util "github.com/ipfs/go-ipfs/util"
+	host "gx/ipfs/QmPsRtodRuBUir32nz5v4zuSBTSszrR1d3fA6Ahb6eaejj/go-libp2p-host"
+	inet "gx/ipfs/QmQx1dHDDYENugYgqA22BaBrRfuv1coSsuPiM7rYh1wwGH/go-libp2p-net"
+	logging "gx/ipfs/QmSpJByNKFX1sCsHBEp3R73FL4NF6FnQTEGyNAXHm2GS52/go-log"
+	ctxio "gx/ipfs/QmTKsRYeY4simJyf37K93juSq75Lo8MVCDJ7owjmf46u8W/go-context/io"
+	ggio "gx/ipfs/QmZ4Qi3GaRbjcx28Sme5eMH7RQjGkt8wHxt2a65oLaeFEV/gogo-protobuf/io"
+	proto "gx/ipfs/QmZ4Qi3GaRbjcx28Sme5eMH7RQjGkt8wHxt2a65oLaeFEV/gogo-protobuf/proto"
+	protocol "gx/ipfs/QmZNkThpqfVXs9GNbexPrfBbXSLNYeKrE7jwFM2oqHbyqN/go-libp2p-protocol"
+	peer "gx/ipfs/QmfMmLGoKzCHDN7cGgk64PJr4iipzidDRME8HABSJqvmhC/go-libp2p-peer"
 )
 
-var log = util.Logger("diagnostics")
+var log = logging.Logger("diagnostics")
 
 // ProtocolDiag is the diagnostics protocol.ID
-var ProtocolDiag protocol.ID = "/ipfs/diagnostics"
+var ProtocolDiag protocol.ID = "/ipfs/diag/net/1.0.0"
+var ProtocolDiagOld protocol.ID = "/ipfs/diagnostics"
 
 var ErrAlreadyRunning = errors.New("diagnostic with that ID already running")
 
@@ -54,6 +55,7 @@ func NewDiagnostics(self peer.ID, h host.Host) *Diagnostics {
 	}
 
 	h.SetStreamHandler(ProtocolDiag, d.handleNewStream)
+	h.SetStreamHandler(ProtocolDiagOld, d.handleNewStream)
 	return d
 }
 
@@ -135,7 +137,7 @@ func newID() string {
 
 // GetDiagnostic runs a diagnostics request across the entire network
 func (d *Diagnostics) GetDiagnostic(ctx context.Context, timeout time.Duration) ([]*DiagInfo, error) {
-	log.Debug("Getting diagnostic.")
+	log.Debug("getting diagnostic")
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -144,7 +146,7 @@ func (d *Diagnostics) GetDiagnostic(ctx context.Context, timeout time.Duration) 
 	d.diagMap[diagID] = time.Now()
 	d.diagLock.Unlock()
 
-	log.Debug("Begin Diagnostic")
+	log.Debug("begin diagnostic")
 
 	peers := d.getPeers()
 	log.Debugf("Sending diagnostic request to %d peers.", len(peers))
@@ -189,7 +191,11 @@ func (d *Diagnostics) getDiagnosticFromPeers(ctx context.Context, peers map[peer
 				return
 			}
 			for d := range out {
-				respdata <- d
+				select {
+				case respdata <- d:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}(p)
 	}
@@ -203,7 +209,7 @@ func (d *Diagnostics) getDiagnosticFromPeers(ctx context.Context, peers map[peer
 }
 
 func (d *Diagnostics) getDiagnosticFromPeer(ctx context.Context, p peer.ID, pmes *pb.Message) (<-chan *DiagInfo, error) {
-	s, err := d.host.NewStream(ProtocolDiag, p)
+	s, err := d.host.NewStream(ctx, p, ProtocolDiag, ProtocolDiagOld)
 	if err != nil {
 		return nil, err
 	}
@@ -236,7 +242,7 @@ func (d *Diagnostics) getDiagnosticFromPeer(ctx context.Context, p peer.ID, pmes
 				return
 			}
 			if rpmes == nil {
-				log.Debug("Got no response back from diag request.")
+				log.Debug("got no response back from diag request")
 				return
 			}
 

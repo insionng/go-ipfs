@@ -4,24 +4,35 @@ import (
 	"testing"
 	"time"
 
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
-
-	ds "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore"
-	dssync "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore/sync"
 	"github.com/ipfs/go-ipfs/blocks/blockstore"
-	key "github.com/ipfs/go-ipfs/blocks/key"
 	bs "github.com/ipfs/go-ipfs/blockservice"
 	"github.com/ipfs/go-ipfs/exchange/offline"
 	mdag "github.com/ipfs/go-ipfs/merkledag"
-	"github.com/ipfs/go-ipfs/util"
+
+	context "context"
+	ds "gx/ipfs/QmRWDav6mzWseLWeYfVd5fvUKiVe9xNH29YfMF438fG364/go-datastore"
+	dssync "gx/ipfs/QmRWDav6mzWseLWeYfVd5fvUKiVe9xNH29YfMF438fG364/go-datastore/sync"
+	"gx/ipfs/Qmb912gdngC1UWwTkhuW8knyRbcWeu5kqkxBpveLmW8bSr/go-ipfs-util"
+	cid "gx/ipfs/QmcTcsTvfaeEBRFo1TkFgT8sRmgi1n1LTZpecfVP8fzpGD/go-cid"
 )
 
-func randNode() (*mdag.Node, key.Key) {
-	nd := new(mdag.Node)
-	nd.Data = make([]byte, 32)
-	util.NewTimeSeededRand().Read(nd.Data)
-	k, _ := nd.Key()
+func randNode() (*mdag.ProtoNode, *cid.Cid) {
+	nd := new(mdag.ProtoNode)
+	nd.SetData(make([]byte, 32))
+	util.NewTimeSeededRand().Read(nd.Data())
+	k := nd.Cid()
 	return nd, k
+}
+
+func assertPinned(t *testing.T, p Pinner, c *cid.Cid, failmsg string) {
+	_, pinned, err := p.IsPinned(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !pinned {
+		t.Fatal(failmsg)
+	}
 }
 
 func TestPinnerBasic(t *testing.T) {
@@ -34,7 +45,7 @@ func TestPinnerBasic(t *testing.T) {
 	dserv := mdag.NewDAGService(bserv)
 
 	// TODO does pinner need to share datastore with blockservice?
-	p := NewPinner(dstore, dserv)
+	p := NewPinner(dstore, dserv, dserv)
 
 	a, ak := randNode()
 	_, err := dserv.Add(a)
@@ -48,13 +59,11 @@ func TestPinnerBasic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !p.IsPinned(ak) {
-		t.Fatal("Failed to find key")
-	}
+	assertPinned(t, p, ak, "Failed to find key")
 
 	// create new node c, to be indirectly pinned through b
-	c, ck := randNode()
-	_, err = dserv.Add(c)
+	c, _ := randNode()
+	ck, err := dserv.Add(c)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,24 +91,24 @@ func TestPinnerBasic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !p.IsPinned(ck) {
-		t.Fatal("Child of recursively pinned node not found")
-	}
+	assertPinned(t, p, ck, "child of recursively pinned node not found")
 
-	bk, _ := b.Key()
-	if !p.IsPinned(bk) {
-		t.Fatal("Recursively pinned node not found..")
-	}
+	bk := b.Cid()
+	assertPinned(t, p, bk, "Recursively pinned node not found..")
 
 	d, _ := randNode()
 	d.AddNodeLink("a", a)
 	d.AddNodeLink("c", c)
 
-	e, ek := randNode()
+	e, _ := randNode()
 	d.AddNodeLink("e", e)
 
 	// Must be in dagserv for unpin to work
-	err = dserv.AddRecursive(d)
+	_, err = dserv.Add(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = dserv.Add(d)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,14 +119,8 @@ func TestPinnerBasic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !p.IsPinned(ek) {
-		t.Fatal(err)
-	}
-
-	dk, _ := d.Key()
-	if !p.IsPinned(dk) {
-		t.Fatal("pinned node not found.")
-	}
+	dk := d.Cid()
+	assertPinned(t, p, dk, "pinned node not found.")
 
 	// Test recursive unpin
 	err = p.Unpin(ctx, dk, true)
@@ -125,35 +128,21 @@ func TestPinnerBasic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// c should still be pinned under b
-	if !p.IsPinned(ck) {
-		t.Fatal("Recursive / indirect unpin fail.")
-	}
-
 	err = p.Flush()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	np, err := LoadPinner(dstore, dserv)
+	np, err := LoadPinner(dstore, dserv, dserv)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Test directly pinned
-	if !np.IsPinned(ak) {
-		t.Fatal("Could not find pinned node!")
-	}
-
-	// Test indirectly pinned
-	if !np.IsPinned(ck) {
-		t.Fatal("could not find indirectly pinned node")
-	}
+	assertPinned(t, np, ak, "Could not find pinned node!")
 
 	// Test recursively pinned
-	if !np.IsPinned(bk) {
-		t.Fatal("could not find recursively pinned node")
-	}
+	assertPinned(t, np, bk, "could not find recursively pinned node")
 }
 
 func TestDuplicateSemantics(t *testing.T) {
@@ -165,7 +154,7 @@ func TestDuplicateSemantics(t *testing.T) {
 	dserv := mdag.NewDAGService(bserv)
 
 	// TODO does pinner need to share datastore with blockservice?
-	p := NewPinner(dstore, dserv)
+	p := NewPinner(dstore, dserv, dserv)
 
 	a, _ := randNode()
 	_, err := dserv.Add(a)
@@ -192,15 +181,30 @@ func TestDuplicateSemantics(t *testing.T) {
 	}
 }
 
-func TestPinRecursiveFail(t *testing.T) {
-	ctx := context.Background()
+func TestFlush(t *testing.T) {
 	dstore := dssync.MutexWrap(ds.NewMapDatastore())
 	bstore := blockstore.NewBlockstore(dstore)
 	bserv := bs.New(bstore, offline.Exchange(bstore))
 
 	dserv := mdag.NewDAGService(bserv)
+	p := NewPinner(dstore, dserv, dserv)
+	_, k := randNode()
 
-	p := NewPinner(dstore, dserv)
+	p.PinWithMode(k, Recursive)
+	if err := p.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	assertPinned(t, p, k, "expected key to still be pinned")
+}
+
+func TestPinRecursiveFail(t *testing.T) {
+	ctx := context.Background()
+	dstore := dssync.MutexWrap(ds.NewMapDatastore())
+	bstore := blockstore.NewBlockstore(dstore)
+	bserv := bs.New(bstore, offline.Exchange(bstore))
+	dserv := mdag.NewDAGService(bserv)
+
+	p := NewPinner(dstore, dserv, dserv)
 
 	a, _ := randNode()
 	b, _ := randNode()
@@ -209,22 +213,27 @@ func TestPinRecursiveFail(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Note: this isnt a time based test, we expect the pin to fail
-	mctx, cancel := context.WithTimeout(ctx, time.Millisecond)
-	defer cancel()
+	// NOTE: This isnt a time based test, we expect the pin to fail
+	mctx, _ := context.WithTimeout(ctx, time.Millisecond)
 	err = p.Pin(mctx, a, true)
 	if err == nil {
 		t.Fatal("should have failed to pin here")
 	}
 
-	if _, err := dserv.Add(b); err != nil {
+	_, err = dserv.Add(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = dserv.Add(a)
+	if err != nil {
 		t.Fatal(err)
 	}
 
 	// this one is time based... but shouldnt cause any issues
-	mctx, cancel = context.WithTimeout(ctx, time.Second)
-	defer cancel()
-	if err := p.Pin(mctx, a, true); err != nil {
+	mctx, _ = context.WithTimeout(ctx, time.Second)
+	err = p.Pin(mctx, a, true)
+	if err != nil {
 		t.Fatal(err)
 	}
 }

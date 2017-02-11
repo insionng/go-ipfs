@@ -3,11 +3,13 @@
 package offline
 
 import (
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
+	"context"
+
 	blocks "github.com/ipfs/go-ipfs/blocks"
 	"github.com/ipfs/go-ipfs/blocks/blockstore"
-	key "github.com/ipfs/go-ipfs/blocks/key"
 	exchange "github.com/ipfs/go-ipfs/exchange"
+
+	cid "gx/ipfs/QmcTcsTvfaeEBRFo1TkFgT8sRmgi1n1LTZpecfVP8fzpGD/go-cid"
 )
 
 func Exchange(bs blockstore.Blockstore) exchange.Interface {
@@ -23,12 +25,12 @@ type offlineExchange struct {
 // GetBlock returns nil to signal that a block could not be retrieved for the
 // given key.
 // NB: This function may return before the timeout expires.
-func (e *offlineExchange) GetBlock(_ context.Context, k key.Key) (*blocks.Block, error) {
+func (e *offlineExchange) GetBlock(_ context.Context, k *cid.Cid) (blocks.Block, error) {
 	return e.bs.Get(k)
 }
 
 // HasBlock always returns nil.
-func (e *offlineExchange) HasBlock(_ context.Context, b *blocks.Block) error {
+func (e *offlineExchange) HasBlock(b blocks.Block) error {
 	return e.bs.Put(b)
 }
 
@@ -39,11 +41,11 @@ func (_ *offlineExchange) Close() error {
 	return nil
 }
 
-func (e *offlineExchange) GetBlocks(ctx context.Context, ks []key.Key) (<-chan *blocks.Block, error) {
-	out := make(chan *blocks.Block, 0)
+func (e *offlineExchange) GetBlocks(ctx context.Context, ks []*cid.Cid) (<-chan blocks.Block, error) {
+	out := make(chan blocks.Block, 0)
 	go func() {
 		defer close(out)
-		var misses []key.Key
+		var misses []*cid.Cid
 		for _, k := range ks {
 			hit, err := e.bs.Get(k)
 			if err != nil {
@@ -65,4 +67,8 @@ func (e *offlineExchange) GetBlocks(ctx context.Context, ks []key.Key) (<-chan *
 		}
 	}()
 	return out, nil
+}
+
+func (e *offlineExchange) IsOnline() bool {
+	return false
 }

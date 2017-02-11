@@ -7,12 +7,13 @@ import (
 
 	cmds "github.com/ipfs/go-ipfs/commands"
 	namesys "github.com/ipfs/go-ipfs/namesys"
-	u "github.com/ipfs/go-ipfs/util"
+	offline "github.com/ipfs/go-ipfs/routing/offline"
+	u "gx/ipfs/Qmb912gdngC1UWwTkhuW8knyRbcWeu5kqkxBpveLmW8bSr/go-ipfs-util"
 )
 
 var IpnsCmd = &cmds.Command{
 	Helptext: cmds.HelpText{
-		Tagline: "Gets the value currently published at an IPNS name",
+		Tagline: "Get the value currently published at an IPNS name.",
 		ShortDescription: `
 IPNS is a PKI namespace, where names are the hashes of public keys, and
 the private key enables publishing new (signed) values. In resolve, the
@@ -29,21 +30,27 @@ Examples:
 Resolve the value of your identity:
 
   > ipfs name resolve
-  QmatmE9msSfkKxoffpHwNLNKgwZG8eT9Bud6YoPab52vpy
+  /ipfs/QmatmE9msSfkKxoffpHwNLNKgwZG8eT9Bud6YoPab52vpy
 
 Resolve the value of another name:
 
-  > ipfs name resolve QmbCMUZw6JFeZ7Wp9jkzbye3Fzp2GGcPgC3nmeUjfVF87n
-  QmatmE9msSfkKxoffpHwNLNKgwZG8eT9Bud6YoPab52vpy
+  > ipfs name resolve QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ
+  /ipfs/QmSiTko9JZyabH56y2fussEt1A5oDqsFXB3CkvAqraFryz
+
+Resolve the value of a reference:
+
+  > ipfs name resolve ipfs.io
+  /ipfs/QmaBvfZooxWkrv7D3r8LS9moNjzD2o525XMZze69hhoxf5
 
 `,
 	},
 
 	Arguments: []cmds.Argument{
-		cmds.StringArg("name", false, false, "The IPNS name to resolve. Defaults to your node's peerID.").EnableStdin(),
+		cmds.StringArg("name", false, false, "The IPNS name to resolve. Defaults to your node's peerID."),
 	},
 	Options: []cmds.Option{
-		cmds.BoolOption("recursive", "r", "Resolve until the result is not an IPNS name"),
+		cmds.BoolOption("recursive", "r", "Resolve until the result is not an IPNS name.").Default(false),
+		cmds.BoolOption("nocache", "n", "Do not use cached entries.").Default(false),
 	},
 	Run: func(req cmds.Request, res cmds.Response) {
 
@@ -61,8 +68,27 @@ Resolve the value of another name:
 			}
 		}
 
-		var name string
+		nocache, _, _ := req.Option("nocache").Bool()
+		local, _, _ := req.Option("local").Bool()
 
+		// default to nodes namesys resolver
+		var resolver namesys.Resolver = n.Namesys
+
+		if local && nocache {
+			res.SetError(errors.New("cannot specify both local and nocache"), cmds.ErrNormal)
+			return
+		}
+
+		if local {
+			offroute := offline.NewOfflineRouter(n.Repo.Datastore(), n.PrivateKey)
+			resolver = namesys.NewRoutingResolver(offroute, 0)
+		}
+
+		if nocache {
+			resolver = namesys.NewNameSystem(n.Routing, n.Repo.Datastore(), 0)
+		}
+
+		var name string
 		if len(req.Arguments()) == 0 {
 			if n.Identity == "" {
 				res.SetError(errors.New("Identity not loaded!"), cmds.ErrNormal)
@@ -80,7 +106,10 @@ Resolve the value of another name:
 			depth = namesys.DefaultDepthLimit
 		}
 
-		resolver := namesys.NewRoutingResolver(n.Routing)
+		if !strings.HasPrefix(name, "/ipns/") {
+			name = "/ipns/" + name
+		}
+
 		output, err := resolver.ResolveN(req.Context(), name, depth)
 		if err != nil {
 			res.SetError(err, cmds.ErrNormal)
@@ -97,7 +126,7 @@ Resolve the value of another name:
 			if !ok {
 				return nil, u.ErrCast()
 			}
-			return strings.NewReader(output.Path.String()), nil
+			return strings.NewReader(output.Path.String() + "\n"), nil
 		},
 	},
 	Type: ResolvedPath{},

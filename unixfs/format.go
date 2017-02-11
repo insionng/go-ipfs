@@ -1,12 +1,14 @@
-// Package format implements a data format for files in the ipfs filesystem
-// It is not the only format in ipfs, but it is the one that the filesystem assumes
+// Package format implements a data format for files in the IPFS filesystem It
+// is not the only format in ipfs, but it is the one that the filesystem
+// assumes
 package unixfs
 
 import (
 	"errors"
 
-	proto "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/gogo/protobuf/proto"
+	dag "github.com/ipfs/go-ipfs/merkledag"
 	pb "github.com/ipfs/go-ipfs/unixfs/pb"
+	proto "gx/ipfs/QmZ4Qi3GaRbjcx28Sme5eMH7RQjGkt8wHxt2a65oLaeFEV/gogo-protobuf/proto"
 )
 
 const (
@@ -14,6 +16,7 @@ const (
 	TFile      = pb.Data_File
 	TDirectory = pb.Data_Directory
 	TMetadata  = pb.Data_Metadata
+	TSymlink   = pb.Data_Symlink
 )
 
 var ErrMalformedFileFormat = errors.New("malformed data in file format")
@@ -48,7 +51,7 @@ func FilePBData(data []byte, totalsize uint64) []byte {
 	return data
 }
 
-// Returns Bytes that represent a Directory
+//FolderPBData returns Bytes that represent a Directory.
 func FolderPBData() []byte {
 	pbfile := new(pb.Data)
 	typ := pb.Data_Directory
@@ -62,11 +65,13 @@ func FolderPBData() []byte {
 	return data
 }
 
+//WrapData marshals raw bytes into a `Data_Raw` type protobuf message.
 func WrapData(b []byte) []byte {
 	pbdata := new(pb.Data)
 	typ := pb.Data_Raw
 	pbdata.Data = b
 	pbdata.Type = &typ
+	pbdata.Filesize = proto.Uint64(uint64(len(b)))
 
 	out, err := proto.Marshal(pbdata)
 	if err != nil {
@@ -77,6 +82,7 @@ func WrapData(b []byte) []byte {
 	return out
 }
 
+//SymlinkData returns a `Data_Symlink` protobuf message for the path you specify.
 func SymlinkData(path string) ([]byte, error) {
 	pbdata := new(pb.Data)
 	typ := pb.Data_Symlink
@@ -180,6 +186,7 @@ type Metadata struct {
 	Size     uint64
 }
 
+//MetadataFromBytes Unmarshals a protobuf message into Metadata.
 func MetadataFromBytes(b []byte) (*Metadata, error) {
 	pbd := new(pb.Data)
 	err := proto.Unmarshal(b, pbd)
@@ -218,4 +225,8 @@ func BytesForMetadata(m *Metadata) ([]byte, error) {
 
 	pbd.Data = mdd
 	return proto.Marshal(pbd)
+}
+
+func EmptyDirNode() *dag.ProtoNode {
+	return dag.NodeWithData(FolderPBData())
 }

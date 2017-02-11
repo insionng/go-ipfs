@@ -2,13 +2,13 @@ package notifications
 
 import (
 	"bytes"
+	"context"
 	"testing"
 	"time"
 
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
 	blocks "github.com/ipfs/go-ipfs/blocks"
 	blocksutil "github.com/ipfs/go-ipfs/blocks/blocksutil"
-	key "github.com/ipfs/go-ipfs/blocks/key"
+	cid "gx/ipfs/QmcTcsTvfaeEBRFo1TkFgT8sRmgi1n1LTZpecfVP8fzpGD/go-cid"
 )
 
 func TestDuplicates(t *testing.T) {
@@ -17,7 +17,7 @@ func TestDuplicates(t *testing.T) {
 
 	n := New()
 	defer n.Shutdown()
-	ch := n.Subscribe(context.Background(), b1.Key(), b2.Key())
+	ch := n.Subscribe(context.Background(), b1.Cid(), b2.Cid())
 
 	n.Publish(b1)
 	blockRecvd, ok := <-ch
@@ -41,7 +41,7 @@ func TestPublishSubscribe(t *testing.T) {
 
 	n := New()
 	defer n.Shutdown()
-	ch := n.Subscribe(context.Background(), blockSent.Key())
+	ch := n.Subscribe(context.Background(), blockSent.Cid())
 
 	n.Publish(blockSent)
 	blockRecvd, ok := <-ch
@@ -59,7 +59,7 @@ func TestSubscribeMany(t *testing.T) {
 
 	n := New()
 	defer n.Shutdown()
-	ch := n.Subscribe(context.Background(), e1.Key(), e2.Key())
+	ch := n.Subscribe(context.Background(), e1.Cid(), e2.Cid())
 
 	n.Publish(e1)
 	r1, ok := <-ch
@@ -83,8 +83,8 @@ func TestDuplicateSubscribe(t *testing.T) {
 
 	n := New()
 	defer n.Shutdown()
-	ch1 := n.Subscribe(context.Background(), e1.Key())
-	ch2 := n.Subscribe(context.Background(), e1.Key())
+	ch1 := n.Subscribe(context.Background(), e1.Cid())
+	ch2 := n.Subscribe(context.Background(), e1.Cid())
 
 	n.Publish(e1)
 	r1, ok := <-ch1
@@ -118,7 +118,7 @@ func TestCarryOnWhenDeadlineExpires(t *testing.T) {
 	n := New()
 	defer n.Shutdown()
 	block := blocks.NewBlock([]byte("A Missed Connection"))
-	blockChannel := n.Subscribe(fastExpiringCtx, block.Key())
+	blockChannel := n.Subscribe(fastExpiringCtx, block.Cid())
 
 	assertBlockChannelNil(t, blockChannel)
 }
@@ -132,10 +132,10 @@ func TestDoesNotDeadLockIfContextCancelledBeforePublish(t *testing.T) {
 
 	t.Log("generate a large number of blocks. exceed default buffer")
 	bs := g.Blocks(1000)
-	ks := func() []key.Key {
-		var keys []key.Key
+	ks := func() []*cid.Cid {
+		var keys []*cid.Cid
 		for _, b := range bs {
-			keys = append(keys, b.Key())
+			keys = append(keys, b.Cid())
 		}
 		return keys
 	}()
@@ -151,18 +151,18 @@ func TestDoesNotDeadLockIfContextCancelledBeforePublish(t *testing.T) {
 	t.Log("publishing the large number of blocks to the ignored channel must not deadlock")
 }
 
-func assertBlockChannelNil(t *testing.T, blockChannel <-chan *blocks.Block) {
+func assertBlockChannelNil(t *testing.T, blockChannel <-chan blocks.Block) {
 	_, ok := <-blockChannel
 	if ok {
 		t.Fail()
 	}
 }
 
-func assertBlocksEqual(t *testing.T, a, b *blocks.Block) {
-	if !bytes.Equal(a.Data, b.Data) {
+func assertBlocksEqual(t *testing.T, a, b blocks.Block) {
+	if !bytes.Equal(a.RawData(), b.RawData()) {
 		t.Fatal("blocks aren't equal")
 	}
-	if a.Key() != b.Key() {
+	if a.Cid() != b.Cid() {
 		t.Fatal("block keys aren't equal")
 	}
 }

@@ -1,30 +1,32 @@
 package supernode
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
-	proto "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/gogo/protobuf/proto"
-	datastore "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore"
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
-
-	key "github.com/ipfs/go-ipfs/blocks/key"
-	peer "github.com/ipfs/go-ipfs/p2p/peer"
-	dhtpb "github.com/ipfs/go-ipfs/routing/dht/pb"
-	record "github.com/ipfs/go-ipfs/routing/record"
 	proxy "github.com/ipfs/go-ipfs/routing/supernode/proxy"
+	dshelp "github.com/ipfs/go-ipfs/thirdparty/ds-help"
+
+	dhtpb "gx/ipfs/QmRG9fdibExi5DFy8kzyxF76jvZVUb2mQBUSMNP1YaYn9M/go-libp2p-kad-dht/pb"
+	datastore "gx/ipfs/QmRWDav6mzWseLWeYfVd5fvUKiVe9xNH29YfMF438fG364/go-datastore"
+	proto "gx/ipfs/QmZ4Qi3GaRbjcx28Sme5eMH7RQjGkt8wHxt2a65oLaeFEV/gogo-protobuf/proto"
+	record "gx/ipfs/QmdM4ohF7cr4MvAECVeD3hRA3HtZrk1ngaek4n8ojVT87h/go-libp2p-record"
+	pb "gx/ipfs/QmdM4ohF7cr4MvAECVeD3hRA3HtZrk1ngaek4n8ojVT87h/go-libp2p-record/pb"
+	pstore "gx/ipfs/QmeXj9VAjmYQZxpmVz7VzccbJrpmr8qkCDSjfVNsPTWTYU/go-libp2p-peerstore"
+	peer "gx/ipfs/QmfMmLGoKzCHDN7cGgk64PJr4iipzidDRME8HABSJqvmhC/go-libp2p-peer"
 )
 
 // Server handles routing queries using a database backend
 type Server struct {
 	local           peer.ID
-	routingBackend  datastore.ThreadSafeDatastore
-	peerstore       peer.Peerstore
+	routingBackend  datastore.Datastore
+	peerstore       pstore.Peerstore
 	*proxy.Loopback // so server can be injected into client
 }
 
 // NewServer creates a new Supernode routing Server
-func NewServer(ds datastore.ThreadSafeDatastore, ps peer.Peerstore, local peer.ID) (*Server, error) {
+func NewServer(ds datastore.Datastore, ps pstore.Peerstore, local peer.ID) (*Server, error) {
 	s := &Server{local, ds, ps, nil}
 	s.Loopback = &proxy.Loopback{
 		Handler: s,
@@ -53,7 +55,7 @@ func (s *Server) handleMessage(
 	switch req.GetType() {
 
 	case dhtpb.Message_GET_VALUE:
-		rawRecord, err := getRoutingRecord(s.routingBackend, key.Key(req.GetKey()))
+		rawRecord, err := getRoutingRecord(s.routingBackend, req.GetKey())
 		if err != nil {
 			return "", nil
 		}
@@ -67,7 +69,7 @@ func (s *Server) handleMessage(
 		// 	log.Event(ctx, "validationFailed", req, p)
 		// 	return "", nil
 		// }
-		putRoutingRecord(s.routingBackend, key.Key(req.GetKey()), req.GetRecord())
+		putRoutingRecord(s.routingBackend, req.GetKey(), req.GetRecord())
 		return p, req
 
 	case dhtpb.Message_FIND_NODE:
@@ -87,7 +89,7 @@ func (s *Server) handleMessage(
 			if providerID == p {
 				store := []*dhtpb.Message_Peer{provider}
 				storeProvidersToPeerstore(s.peerstore, p, store)
-				if err := putRoutingProviders(s.routingBackend, key.Key(req.GetKey()), store); err != nil {
+				if err := putRoutingProviders(s.routingBackend, req.GetKey(), store); err != nil {
 					return "", nil
 				}
 			} else {
@@ -97,7 +99,7 @@ func (s *Server) handleMessage(
 		return "", nil
 
 	case dhtpb.Message_GET_PROVIDERS:
-		providers, err := getRoutingProviders(s.routingBackend, key.Key(req.GetKey()))
+		providers, err := getRoutingProviders(s.routingBackend, req.GetKey())
 		if err != nil {
 			return "", nil
 		}
@@ -114,8 +116,8 @@ func (s *Server) handleMessage(
 var _ proxy.RequestHandler = &Server{}
 var _ proxy.Proxy = &Server{}
 
-func getRoutingRecord(ds datastore.Datastore, k key.Key) (*dhtpb.Record, error) {
-	dskey := k.DsKey()
+func getRoutingRecord(ds datastore.Datastore, k string) (*pb.Record, error) {
+	dskey := dshelp.NewKeyFromBinary([]byte(k))
 	val, err := ds.Get(dskey)
 	if err != nil {
 		return nil, err
@@ -124,19 +126,19 @@ func getRoutingRecord(ds datastore.Datastore, k key.Key) (*dhtpb.Record, error) 
 	if !ok {
 		return nil, fmt.Errorf("datastore had non byte-slice value for %v", dskey)
 	}
-	var record dhtpb.Record
+	var record pb.Record
 	if err := proto.Unmarshal(recordBytes, &record); err != nil {
 		return nil, errors.New("failed to unmarshal dht record from datastore")
 	}
 	return &record, nil
 }
 
-func putRoutingRecord(ds datastore.Datastore, k key.Key, value *dhtpb.Record) error {
+func putRoutingRecord(ds datastore.Datastore, k string, value *pb.Record) error {
 	data, err := proto.Marshal(value)
 	if err != nil {
 		return err
 	}
-	dskey := k.DsKey()
+	dskey := dshelp.NewKeyFromBinary([]byte(k))
 	// TODO namespace
 	if err := ds.Put(dskey, data); err != nil {
 		return err
@@ -144,8 +146,8 @@ func putRoutingRecord(ds datastore.Datastore, k key.Key, value *dhtpb.Record) er
 	return nil
 }
 
-func putRoutingProviders(ds datastore.Datastore, k key.Key, newRecords []*dhtpb.Message_Peer) error {
-	log.Event(context.Background(), "putRoutingProviders", &k)
+func putRoutingProviders(ds datastore.Datastore, k string, newRecords []*dhtpb.Message_Peer) error {
+	log.Event(context.Background(), "putRoutingProviders")
 	oldRecords, err := getRoutingProviders(ds, k)
 	if err != nil {
 		return err
@@ -169,7 +171,7 @@ func putRoutingProviders(ds datastore.Datastore, k key.Key, newRecords []*dhtpb.
 	return ds.Put(providerKey(k), data)
 }
 
-func storeProvidersToPeerstore(ps peer.Peerstore, p peer.ID, providers []*dhtpb.Message_Peer) {
+func storeProvidersToPeerstore(ps pstore.Peerstore, p peer.ID, providers []*dhtpb.Message_Peer) {
 	for _, provider := range providers {
 		providerID := peer.ID(provider.GetId())
 		if providerID != p {
@@ -178,13 +180,13 @@ func storeProvidersToPeerstore(ps peer.Peerstore, p peer.ID, providers []*dhtpb.
 		}
 		for _, maddr := range provider.Addresses() {
 			// as a router, we want to store addresses for peers who have provided
-			ps.AddAddr(p, maddr, peer.AddressTTL)
+			ps.AddAddr(p, maddr, pstore.AddressTTL)
 		}
 	}
 }
 
-func getRoutingProviders(ds datastore.Datastore, k key.Key) ([]*dhtpb.Message_Peer, error) {
-	e := log.EventBegin(context.Background(), "getProviders", &k)
+func getRoutingProviders(ds datastore.Datastore, k string) ([]*dhtpb.Message_Peer, error) {
+	e := log.EventBegin(context.Background(), "getProviders")
 	defer e.Done()
 	var providers []*dhtpb.Message_Peer
 	if v, err := ds.Get(providerKey(k)); err == nil {
@@ -199,11 +201,11 @@ func getRoutingProviders(ds datastore.Datastore, k key.Key) ([]*dhtpb.Message_Pe
 	return providers, nil
 }
 
-func providerKey(k key.Key) datastore.Key {
-	return datastore.KeyWithNamespaces([]string{"routing", "providers", k.String()})
+func providerKey(k string) datastore.Key {
+	return datastore.KeyWithNamespaces([]string{"routing", "providers", k})
 }
 
-func verify(ps peer.Peerstore, r *dhtpb.Record) error {
+func verify(ps pstore.Peerstore, r *pb.Record) error {
 	v := make(record.Validator)
 	v["pk"] = record.PublicKeyValidator
 	p := peer.ID(r.GetAuthor())

@@ -15,13 +15,17 @@ import (
 	cmds "github.com/ipfs/go-ipfs/commands"
 	config "github.com/ipfs/go-ipfs/repo/config"
 
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
+	context "context"
 )
 
 const (
 	ApiUrlFormat = "http://%s%s/%s?%s"
 	ApiPath      = "/api/v0" // TODO: make configurable
 )
+
+var OptionSkipMap = map[string]bool{
+	"api": true,
+}
 
 // Client is the commands HTTP client interface.
 type Client interface {
@@ -30,20 +34,13 @@ type Client interface {
 
 type client struct {
 	serverAddress string
-	httpClient    http.Client
+	httpClient    *http.Client
 }
 
 func NewClient(address string) Client {
-	// We cannot use the default transport because of a bug in go's connection reuse
-	// code. It causes random failures in the connection including io.EOF and connection
-	// refused on 'client.Do'
 	return &client{
 		serverAddress: address,
-		httpClient: http.Client{
-			Transport: &http.Transport{
-				DisableKeepAlives: true,
-			},
-		},
+		httpClient:    http.DefaultClient,
 	}
 }
 
@@ -79,10 +76,6 @@ func (c *client) Send(req cmds.Request) (cmds.Response, error) {
 	if req.Files() != nil {
 		fileReader = NewMultiFileReader(req.Files(), true)
 		reader = fileReader
-	} else {
-		// if we have no file data, use an empty Reader
-		// (http.NewRequest panics when a nil Reader is used)
-		reader = strings.NewReader("")
 	}
 
 	path := strings.Join(req.Path(), "/")
@@ -96,63 +89,46 @@ func (c *client) Send(req cmds.Request) (cmds.Response, error) {
 	// TODO extract string consts?
 	if fileReader != nil {
 		httpReq.Header.Set(contentTypeHeader, "multipart/form-data; boundary="+fileReader.Boundary())
-		httpReq.Header.Set(contentDispHeader, "form-data: name=\"files\"")
 	} else {
 		httpReq.Header.Set(contentTypeHeader, applicationOctetStream)
 	}
-	version := config.CurrentVersionNumber
-	httpReq.Header.Set(uaHeader, fmt.Sprintf("/go-ipfs/%s/", version))
+	httpReq.Header.Set(uaHeader, config.ApiVersion)
 
-	ec := make(chan error, 1)
-	rc := make(chan cmds.Response, 1)
-	dc := req.Context().Done()
+	httpReq.Cancel = req.Context().Done()
+	httpReq.Close = true
 
-	go func() {
-		httpRes, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			ec <- err
-			return
-		}
-
-		// using the overridden JSON encoding in request
-		res, err := getResponse(httpRes, req)
-		if err != nil {
-			ec <- err
-			return
-		}
-
-		rc <- res
-	}()
-
-	for {
-		select {
-		case <-dc:
-			log.Debug("Context cancelled, cancelling HTTP request...")
-			tr := http.DefaultTransport.(*http.Transport)
-			tr.CancelRequest(httpReq)
-			dc = nil // Wait for ec or rc
-		case err := <-ec:
-			return nil, err
-		case res := <-rc:
-			if found && len(previousUserProvidedEncoding) > 0 {
-				// reset to user provided encoding after sending request
-				// NB: if user has provided an encoding but it is the empty string,
-				// still leave it as JSON.
-				req.SetOption(cmds.EncShort, previousUserProvidedEncoding)
-			}
-			return res, nil
-		}
+	httpRes, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
 	}
+
+	// using the overridden JSON encoding in request
+	res, err := getResponse(httpRes, req)
+	if err != nil {
+		return nil, err
+	}
+
+	if found && len(previousUserProvidedEncoding) > 0 {
+		// reset to user provided encoding after sending request
+		// NB: if user has provided an encoding but it is the empty string,
+		// still leave it as JSON.
+		req.SetOption(cmds.EncShort, previousUserProvidedEncoding)
+	}
+
+	return res, nil
 }
 
 func getQuery(req cmds.Request) (string, error) {
 	query := url.Values{}
 	for k, v := range req.Options() {
+		if OptionSkipMap[k] {
+			continue
+		}
 		str := fmt.Sprintf("%v", v)
 		query.Set(k, str)
 	}
 
-	args := req.Arguments()
+	args := req.StringArguments()
 	argDefs := req.Command().Arguments
 
 	argDefIndex := 0
@@ -183,7 +159,7 @@ func getResponse(httpRes *http.Response, req cmds.Request) (cmds.Response, error
 	contentType := httpRes.Header.Get(contentTypeHeader)
 	contentType = strings.Split(contentType, ";")[0]
 
-	lengthHeader := httpRes.Header.Get(contentLengthHeader)
+	lengthHeader := httpRes.Header.Get(extraContentLengthHeader)
 	if len(lengthHeader) > 0 {
 		length, err := strconv.ParseUint(lengthHeader, 10, 64)
 		if err != nil {
@@ -204,7 +180,7 @@ func getResponse(httpRes *http.Response, req cmds.Request) (cmds.Response, error
 		// if output is coming from a channel, decode each chunk
 		outChan := make(chan interface{})
 
-		go readStreamedJson(req, rr, outChan)
+		go readStreamedJson(req, rr, outChan, res)
 
 		res.SetOutput((<-chan interface{})(outChan))
 		return res, nil
@@ -257,7 +233,7 @@ func getResponse(httpRes *http.Response, req cmds.Request) (cmds.Response, error
 
 // read json objects off of the given stream, and write the objects out to
 // the 'out' channel
-func readStreamedJson(req cmds.Request, rr io.Reader, out chan<- interface{}) {
+func readStreamedJson(req cmds.Request, rr io.Reader, out chan<- interface{}, resp cmds.Response) {
 	defer close(out)
 	dec := json.NewDecoder(rr)
 	outputType := reflect.TypeOf(req.Command().Type)
@@ -269,6 +245,7 @@ func readStreamedJson(req cmds.Request, rr io.Reader, out chan<- interface{}) {
 		if err != nil {
 			if err != io.EOF {
 				log.Error(err)
+				resp.SetError(err, cmds.ErrNormal)
 			}
 			return
 		}

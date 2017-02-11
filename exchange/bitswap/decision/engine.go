@@ -3,14 +3,15 @@ package decision
 
 import (
 	"sync"
+	"time"
 
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
+	context "context"
 	blocks "github.com/ipfs/go-ipfs/blocks"
 	bstore "github.com/ipfs/go-ipfs/blocks/blockstore"
 	bsmsg "github.com/ipfs/go-ipfs/exchange/bitswap/message"
 	wl "github.com/ipfs/go-ipfs/exchange/bitswap/wantlist"
-	peer "github.com/ipfs/go-ipfs/p2p/peer"
-	eventlog "github.com/ipfs/go-ipfs/thirdparty/eventlog"
+	logging "gx/ipfs/QmSpJByNKFX1sCsHBEp3R73FL4NF6FnQTEGyNAXHm2GS52/go-log"
+	peer "gx/ipfs/QmfMmLGoKzCHDN7cGgk64PJr4iipzidDRME8HABSJqvmhC/go-libp2p-peer"
 )
 
 // TODO consider taking responsibility for other types of requests. For
@@ -21,7 +22,8 @@ import (
 // batches/combines and takes all of these into consideration.
 //
 // Right now, messages go onto the network for four reasons:
-// 1. an initial `sendwantlist` message to a provider of the first key in a request
+// 1. an initial `sendwantlist` message to a provider of the first key in a
+//    request
 // 2. a periodic full sweep of `sendwantlist` messages to all providers
 // 3. upon receipt of blocks, a `cancel` message to all peers
 // 4. draining the priority queue of `blockrequests` from peers
@@ -34,16 +36,17 @@ import (
 // Some examples of what would be possible:
 //
 // * when sending out the wantlists, include `cancel` requests
-// * when handling `blockrequests`, include `sendwantlist` and `cancel` as appropriate
+// * when handling `blockrequests`, include `sendwantlist` and `cancel` as
+//   appropriate
 // * when handling `cancel`, if we recently received a wanted block from a
-// 	 peer, include a partial wantlist that contains a few other high priority
+//   peer, include a partial wantlist that contains a few other high priority
 //   blocks
 //
 // In a sense, if we treat the decision engine as a black box, it could do
 // whatever it sees fit to produce desired outcomes (get wanted keys
 // quickly, maintain good relationships with peers, etc).
 
-var log = eventlog.Logger("engine")
+var log = logging.Logger("engine")
 
 const (
 	// outboxChanBuffer must be 0 to prevent stale messages from being sent
@@ -56,7 +59,7 @@ type Envelope struct {
 	Peer peer.ID
 
 	// Block is the payload
-	Block *blocks.Block
+	Block blocks.Block
 
 	// A callback to notify the decision queue that the task is complete
 	Sent func()
@@ -66,7 +69,7 @@ type Engine struct {
 	// peerRequestQueue is a priority queue of requests received from peers.
 	// Requests are popped from the queue, packaged up, and placed in the
 	// outbox.
-	peerRequestQueue peerRequestQueue
+	peerRequestQueue *prq
 
 	// FIXME it's a bit odd for the client and the worker to both share memory
 	// (both modify the peerRequestQueue) and also to communicate over the
@@ -81,9 +84,11 @@ type Engine struct {
 
 	bs bstore.Blockstore
 
-	lock sync.RWMutex // protects the fields immediatly below
+	lock sync.Mutex // protects the fields immediatly below
 	// ledgerMap lists Ledgers by their Partner key.
 	ledgerMap map[peer.ID]*ledger
+
+	ticker *time.Ticker
 }
 
 func NewEngine(ctx context.Context, bs bstore.Blockstore) *Engine {
@@ -93,12 +98,13 @@ func NewEngine(ctx context.Context, bs bstore.Blockstore) *Engine {
 		peerRequestQueue: newPRQ(),
 		outbox:           make(chan (<-chan *Envelope), outboxChanBuffer),
 		workSignal:       make(chan struct{}, 1),
+		ticker:           time.NewTicker(time.Millisecond * 100),
 	}
 	go e.taskWorker(ctx)
 	return e
 }
 
-func (e *Engine) WantlistForPeer(p peer.ID) (out []wl.Entry) {
+func (e *Engine) WantlistForPeer(p peer.ID) (out []*wl.Entry) {
 	e.lock.Lock()
 	partner, ok := e.ledgerMap[p]
 	if ok {
@@ -106,6 +112,21 @@ func (e *Engine) WantlistForPeer(p peer.ID) (out []wl.Entry) {
 	}
 	e.lock.Unlock()
 	return out
+}
+
+func (e *Engine) LedgerForPeer(p peer.ID) *Receipt {
+	ledger := e.findOrCreate(p)
+
+	ledger.lk.Lock()
+	defer ledger.lk.Unlock()
+
+	return &Receipt{
+		Peer:      ledger.Partner.String(),
+		Value:     ledger.Accounting.Value(),
+		Sent:      ledger.Accounting.BytesSent,
+		Recv:      ledger.Accounting.BytesRecv,
+		Exchanged: ledger.ExchangeCount(),
+	}
 }
 
 func (e *Engine) taskWorker(ctx context.Context) {
@@ -140,13 +161,17 @@ func (e *Engine) nextEnvelope(ctx context.Context) (*Envelope, error) {
 				return nil, ctx.Err()
 			case <-e.workSignal:
 				nextTask = e.peerRequestQueue.Pop()
+			case <-e.ticker.C:
+				e.peerRequestQueue.thawRound()
+				nextTask = e.peerRequestQueue.Pop()
 			}
 		}
 
 		// with a task in hand, we're ready to prepare the envelope...
 
-		block, err := e.bs.Get(nextTask.Entry.Key)
+		block, err := e.bs.Get(nextTask.Entry.Cid)
 		if err != nil {
+			log.Errorf("tried to execute a task and errored fetching block: %s", err)
 			// If we don't have the block, don't hold that against the peer
 			// make sure to update that the task has been 'completed'
 			nextTask.Done()
@@ -176,8 +201,8 @@ func (e *Engine) Outbox() <-chan (<-chan *Envelope) {
 
 // Returns a slice of Peers with whom the local node has active sessions
 func (e *Engine) Peers() []peer.ID {
-	e.lock.RLock()
-	defer e.lock.RUnlock()
+	e.lock.Lock()
+	defer e.lock.Unlock()
 
 	response := make([]peer.ID, 0)
 	for _, ledger := range e.ledgerMap {
@@ -189,9 +214,6 @@ func (e *Engine) Peers() []peer.ID {
 // MessageReceived performs book-keeping. Returns error if passed invalid
 // arguments.
 func (e *Engine) MessageReceived(p peer.ID, m bsmsg.BitSwapMessage) error {
-	e.lock.Lock()
-	defer e.lock.Unlock()
-
 	if len(m.Wantlist()) == 0 && len(m.Blocks()) == 0 {
 		log.Debugf("received empty message from %s", p)
 	}
@@ -204,19 +226,21 @@ func (e *Engine) MessageReceived(p peer.ID, m bsmsg.BitSwapMessage) error {
 	}()
 
 	l := e.findOrCreate(p)
+	l.lk.Lock()
+	defer l.lk.Unlock()
 	if m.Full() {
 		l.wantList = wl.New()
 	}
 
 	for _, entry := range m.Wantlist() {
 		if entry.Cancel {
-			log.Debugf("cancel %s", entry.Key)
-			l.CancelWant(entry.Key)
-			e.peerRequestQueue.Remove(entry.Key, p)
+			log.Debugf("%s cancel %s", p, entry.Cid)
+			l.CancelWant(entry.Cid)
+			e.peerRequestQueue.Remove(entry.Cid, p)
 		} else {
-			log.Debugf("wants %s - %d", entry.Key, entry.Priority)
-			l.Wants(entry.Key, entry.Priority)
-			if exists, err := e.bs.Has(entry.Key); err == nil && exists {
+			log.Debugf("wants %s - %d", entry.Cid, entry.Priority)
+			l.Wants(entry.Cid, entry.Priority)
+			if exists, err := e.bs.Has(entry.Cid); err == nil && exists {
 				e.peerRequestQueue.Push(entry.Entry, p)
 				newWorkExists = true
 			}
@@ -224,16 +248,34 @@ func (e *Engine) MessageReceived(p peer.ID, m bsmsg.BitSwapMessage) error {
 	}
 
 	for _, block := range m.Blocks() {
-		log.Debugf("got block %s %d bytes", block.Key(), len(block.Data))
-		l.ReceivedBytes(len(block.Data))
-		for _, l := range e.ledgerMap {
-			if entry, ok := l.WantListContains(block.Key()); ok {
-				e.peerRequestQueue.Push(entry, l.Partner)
-				newWorkExists = true
-			}
-		}
+		log.Debugf("got block %s %d bytes", block, len(block.RawData()))
+		l.ReceivedBytes(len(block.RawData()))
 	}
 	return nil
+}
+
+func (e *Engine) addBlock(block blocks.Block) {
+	work := false
+
+	for _, l := range e.ledgerMap {
+		l.lk.Lock()
+		if entry, ok := l.WantListContains(block.Cid()); ok {
+			e.peerRequestQueue.Push(entry, l.Partner)
+			work = true
+		}
+		l.lk.Unlock()
+	}
+
+	if work {
+		e.signalNewWork()
+	}
+}
+
+func (e *Engine) AddBlock(block blocks.Block) {
+	e.lock.Lock()
+	defer e.lock.Unlock()
+
+	e.addBlock(block)
 }
 
 // TODO add contents of m.WantList() to my local wantlist? NB: could introduce
@@ -243,14 +285,11 @@ func (e *Engine) MessageReceived(p peer.ID, m bsmsg.BitSwapMessage) error {
 // send happen atomically
 
 func (e *Engine) MessageSent(p peer.ID, m bsmsg.BitSwapMessage) error {
-	e.lock.Lock()
-	defer e.lock.Unlock()
-
 	l := e.findOrCreate(p)
 	for _, block := range m.Blocks() {
-		l.SentBytes(len(block.Data))
-		l.wantList.Remove(block.Key())
-		e.peerRequestQueue.Remove(block.Key(), p)
+		l.SentBytes(len(block.RawData()))
+		l.wantList.Remove(block.Cid())
+		e.peerRequestQueue.Remove(block.Cid(), p)
 	}
 
 	return nil
@@ -272,11 +311,13 @@ func (e *Engine) numBytesReceivedFrom(p peer.ID) uint64 {
 
 // ledger lazily instantiates a ledger
 func (e *Engine) findOrCreate(p peer.ID) *ledger {
+	e.lock.Lock()
 	l, ok := e.ledgerMap[p]
 	if !ok {
 		l = newLedger(p)
 		e.ledgerMap[p] = l
 	}
+	e.lock.Unlock()
 	return l
 }
 

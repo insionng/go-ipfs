@@ -12,28 +12,28 @@ import (
 	gopath "path"
 	"time"
 
-	ma "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-multiaddr"
 	random "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-random"
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
-	"github.com/ipfs/go-ipfs/util/ipfsaddr"
-
-	"github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore"
-	syncds "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore/sync"
 	commands "github.com/ipfs/go-ipfs/commands"
 	core "github.com/ipfs/go-ipfs/core"
 	corehttp "github.com/ipfs/go-ipfs/core/corehttp"
 	corerouting "github.com/ipfs/go-ipfs/core/corerouting"
 	"github.com/ipfs/go-ipfs/core/coreunix"
-	peer "github.com/ipfs/go-ipfs/p2p/peer"
 	"github.com/ipfs/go-ipfs/repo"
 	config "github.com/ipfs/go-ipfs/repo/config"
 	fsrepo "github.com/ipfs/go-ipfs/repo/fsrepo"
-	eventlog "github.com/ipfs/go-ipfs/thirdparty/eventlog"
+	ds2 "github.com/ipfs/go-ipfs/thirdparty/datastore2"
+	"github.com/ipfs/go-ipfs/thirdparty/ipfsaddr"
 	unit "github.com/ipfs/go-ipfs/thirdparty/unit"
-	ds2 "github.com/ipfs/go-ipfs/util/datastore2"
+	"gx/ipfs/QmRWDav6mzWseLWeYfVd5fvUKiVe9xNH29YfMF438fG364/go-datastore"
+	syncds "gx/ipfs/QmRWDav6mzWseLWeYfVd5fvUKiVe9xNH29YfMF438fG364/go-datastore/sync"
+
+	context "context"
+	logging "gx/ipfs/QmSpJByNKFX1sCsHBEp3R73FL4NF6FnQTEGyNAXHm2GS52/go-log"
+	ma "gx/ipfs/QmUAQaWbKxGCUTuoQVvvicbQNZ9APF5pDGWyAZSe93AtKH/go-multiaddr"
+	pstore "gx/ipfs/QmeXj9VAjmYQZxpmVz7VzccbJrpmr8qkCDSjfVNsPTWTYU/go-libp2p-peerstore"
 )
 
-var elog = eventlog.Logger("gc-client")
+var elog = logging.Logger("gc-client")
 
 var (
 	cat             = flag.Bool("cat", false, "else add")
@@ -89,9 +89,9 @@ func run() error {
 		addrs = append(addrs, addr)
 	}
 
-	var infos []peer.PeerInfo
+	var infos []pstore.PeerInfo
 	for _, addr := range addrs {
-		infos = append(infos, peer.PeerInfo{
+		infos = append(infos, pstore.PeerInfo{
 			ID:    addr.ID(),
 			Addrs: []ma.Multiaddr{addr.Transport()},
 		})
@@ -142,6 +142,7 @@ func sizeOfIthFile(i int64) int64 {
 }
 
 func runFileAddingWorker(n *core.IpfsNode) error {
+	errs := make(chan error)
 	go func() {
 		var i int64
 		for i = 1; i < math.MaxInt32; i++ {
@@ -149,17 +150,26 @@ func runFileAddingWorker(n *core.IpfsNode) error {
 			go func() {
 				defer pipew.Close()
 				if err := random.WritePseudoRandomBytes(sizeOfIthFile(i), pipew, *seed); err != nil {
-					log.Fatal(err)
+					errs <- err
 				}
 			}()
 			k, err := coreunix.Add(n, piper)
 			if err != nil {
-				log.Fatal(err)
+				errs <- err
 			}
 			log.Println("added file", "seed", *seed, "#", i, "key", k, "size", unit.Information(sizeOfIthFile(i)))
 			time.Sleep(1 * time.Second)
 		}
 	}()
+
+	var i int64
+	for i = 0; i < math.MaxInt32; i++ {
+		err := <-errs
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
 	return nil
 }
 
@@ -180,26 +190,28 @@ func runFileCattingWorker(ctx context.Context, n *core.IpfsNode) error {
 		return err
 	}
 
+	errs := make(chan error)
+
 	go func() {
 		defer dummy.Close()
 		var i int64 = 1
 		for {
 			buf := new(bytes.Buffer)
 			if err := random.WritePseudoRandomBytes(sizeOfIthFile(i), buf, *seed); err != nil {
-				log.Fatal(err)
+				errs <- err
 			}
 			// add to a dummy node to discover the key
 			k, err := coreunix.Add(dummy, bytes.NewReader(buf.Bytes()))
 			if err != nil {
-				log.Fatal(err)
+				errs <- err
 			}
-			e := elog.EventBegin(ctx, "cat", eventlog.LoggableF(func() map[string]interface{} {
+			e := elog.EventBegin(ctx, "cat", logging.LoggableF(func() map[string]interface{} {
 				return map[string]interface{}{
 					"key":       k,
 					"localPeer": n.Identity,
 				}
 			}))
-			if r, err := coreunix.Cat(n, k); err != nil {
+			if r, err := coreunix.Cat(ctx, n, k); err != nil {
 				e.Done()
 				log.Printf("failed to cat file. seed: %d #%d key: %s err: %s", *seed, i, k, err)
 			} else {
@@ -212,11 +224,17 @@ func runFileCattingWorker(ctx context.Context, n *core.IpfsNode) error {
 			time.Sleep(time.Second)
 		}
 	}()
+
+	err = <-errs
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	return nil
 }
 
-func toPeerInfos(bpeers []config.BootstrapPeer) ([]peer.PeerInfo, error) {
-	var peers []peer.PeerInfo
+func toPeerInfos(bpeers []config.BootstrapPeer) ([]pstore.PeerInfo, error) {
+	var peers []pstore.PeerInfo
 	for _, bootstrap := range bpeers {
 		p, err := toPeerInfo(bootstrap)
 		if err != nil {
@@ -227,8 +245,8 @@ func toPeerInfos(bpeers []config.BootstrapPeer) ([]peer.PeerInfo, error) {
 	return peers, nil
 }
 
-func toPeerInfo(bootstrap config.BootstrapPeer) (p peer.PeerInfo, err error) {
-	p = peer.PeerInfo{
+func toPeerInfo(bootstrap config.BootstrapPeer) (p pstore.PeerInfo, err error) {
+	p = pstore.PeerInfo{
 		ID:    bootstrap.ID(),
 		Addrs: []ma.Multiaddr{bootstrap.Multiaddr()},
 	}

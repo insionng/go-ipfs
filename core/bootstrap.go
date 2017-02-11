@@ -8,18 +8,18 @@ import (
 	"sync"
 	"time"
 
-	host "github.com/ipfs/go-ipfs/p2p/host"
-	inet "github.com/ipfs/go-ipfs/p2p/net"
-	peer "github.com/ipfs/go-ipfs/p2p/peer"
 	config "github.com/ipfs/go-ipfs/repo/config"
 	math2 "github.com/ipfs/go-ipfs/thirdparty/math2"
-	lgbl "github.com/ipfs/go-ipfs/util/eventlog/loggables"
+	lgbl "gx/ipfs/QmTMy4hVSY28DdwJ9kBz6y7q6MuioFzPcpM3Ma3aPjo1i3/go-libp2p-loggables"
 
-	ma "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-multiaddr"
-	goprocess "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/goprocess"
-	procctx "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/goprocess/context"
-	periodicproc "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/goprocess/periodic"
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
+	context "context"
+	host "gx/ipfs/QmPsRtodRuBUir32nz5v4zuSBTSszrR1d3fA6Ahb6eaejj/go-libp2p-host"
+	inet "gx/ipfs/QmQx1dHDDYENugYgqA22BaBrRfuv1coSsuPiM7rYh1wwGH/go-libp2p-net"
+	goprocess "gx/ipfs/QmSF8fPo3jgVBAy8fpdjjYqgG87dkJgUprRBHRd2tmfgpP/goprocess"
+	procctx "gx/ipfs/QmSF8fPo3jgVBAy8fpdjjYqgG87dkJgUprRBHRd2tmfgpP/goprocess/context"
+	periodicproc "gx/ipfs/QmSF8fPo3jgVBAy8fpdjjYqgG87dkJgUprRBHRd2tmfgpP/goprocess/periodic"
+	pstore "gx/ipfs/QmeXj9VAjmYQZxpmVz7VzccbJrpmr8qkCDSjfVNsPTWTYU/go-libp2p-peerstore"
+	peer "gx/ipfs/QmfMmLGoKzCHDN7cGgk64PJr4iipzidDRME8HABSJqvmhC/go-libp2p-peer"
 )
 
 // ErrNotEnoughBootstrapPeers signals that we do not have enough bootstrap
@@ -50,7 +50,7 @@ type BootstrapConfig struct {
 	// BootstrapPeers is a function that returns a set of bootstrap peers
 	// for the bootstrap process to use. This makes it possible for clients
 	// to control the peers the process uses at any moment.
-	BootstrapPeers func() []peer.PeerInfo
+	BootstrapPeers func() []pstore.PeerInfo
 }
 
 // DefaultBootstrapConfig specifies default sane parameters for bootstrapping.
@@ -60,9 +60,9 @@ var DefaultBootstrapConfig = BootstrapConfig{
 	ConnectionTimeout: (30 * time.Second) / 3, // Perod / 3
 }
 
-func BootstrapConfigWithPeers(pis []peer.PeerInfo) BootstrapConfig {
+func BootstrapConfigWithPeers(pis []pstore.PeerInfo) BootstrapConfig {
 	cfg := DefaultBootstrapConfig
-	cfg.BootstrapPeers = func() []peer.PeerInfo {
+	cfg.BootstrapPeers = func() []pstore.PeerInfo {
 		return pis
 	}
 	return cfg
@@ -129,7 +129,7 @@ func bootstrapRound(ctx context.Context, host host.Host, cfg BootstrapConfig) er
 	numToDial := cfg.MinPeerThreshold - len(connected)
 
 	// filter out bootstrap nodes we are already connected to
-	var notConnected []peer.PeerInfo
+	var notConnected []pstore.PeerInfo
 	for _, p := range peers {
 		if host.Network().Connectedness(p.ID) != inet.Connected {
 			notConnected = append(notConnected, p)
@@ -153,7 +153,7 @@ func bootstrapRound(ctx context.Context, host host.Host, cfg BootstrapConfig) er
 	return nil
 }
 
-func bootstrapConnect(ctx context.Context, ph host.Host, peers []peer.PeerInfo) error {
+func bootstrapConnect(ctx context.Context, ph host.Host, peers []pstore.PeerInfo) error {
 	if len(peers) < 1 {
 		return ErrNotEnoughBootstrapPeers
 	}
@@ -168,12 +168,12 @@ func bootstrapConnect(ctx context.Context, ph host.Host, peers []peer.PeerInfo) 
 		// Also, performed asynchronously for dial speed.
 
 		wg.Add(1)
-		go func(p peer.PeerInfo) {
+		go func(p pstore.PeerInfo) {
 			defer wg.Done()
 			defer log.EventBegin(ctx, "bootstrapDial", ph.ID(), p.ID).Done()
 			log.Debugf("%s bootstrapping to %s", ph.ID(), p.ID)
 
-			ph.Peerstore().AddAddrs(p.ID, p.Addrs, peer.PermanentAddrTTL)
+			ph.Peerstore().AddAddrs(p.ID, p.Addrs, pstore.PermanentAddrTTL)
 			if err := ph.Connect(ctx, p); err != nil {
 				log.Event(ctx, "bootstrapDialFailed", p.ID)
 				log.Debugf("failed to bootstrap with %v: %s", p.ID, err)
@@ -202,30 +202,30 @@ func bootstrapConnect(ctx context.Context, ph host.Host, peers []peer.PeerInfo) 
 	return nil
 }
 
-func toPeerInfos(bpeers []config.BootstrapPeer) []peer.PeerInfo {
-	var peers []peer.PeerInfo
+func toPeerInfos(bpeers []config.BootstrapPeer) []pstore.PeerInfo {
+	pinfos := make(map[peer.ID]*pstore.PeerInfo)
 	for _, bootstrap := range bpeers {
-		peers = append(peers, toPeerInfo(bootstrap))
+		pinfo, ok := pinfos[bootstrap.ID()]
+		if !ok {
+			pinfo = new(pstore.PeerInfo)
+			pinfos[bootstrap.ID()] = pinfo
+			pinfo.ID = bootstrap.ID()
+		}
+
+		pinfo.Addrs = append(pinfo.Addrs, bootstrap.Transport())
 	}
+
+	var peers []pstore.PeerInfo
+	for _, pinfo := range pinfos {
+		peers = append(peers, *pinfo)
+	}
+
 	return peers
 }
 
-func toPeerInfo(bp config.BootstrapPeer) peer.PeerInfo {
-	// for now, we drop the "ipfs addr" part of the multiaddr. the rest
-	// of the codebase currently uses addresses without the peerid part.
-	m := bp.Multiaddr()
-	s := ma.Split(m)
-	m = ma.Join(s[:len(s)-1]...)
-
-	return peer.PeerInfo{
-		ID:    bp.ID(),
-		Addrs: []ma.Multiaddr{m},
-	}
-}
-
-func randomSubsetOfPeers(in []peer.PeerInfo, max int) []peer.PeerInfo {
+func randomSubsetOfPeers(in []pstore.PeerInfo, max int) []pstore.PeerInfo {
 	n := math2.IntMin(max, len(in))
-	var out []peer.PeerInfo
+	var out []pstore.PeerInfo
 	for _, val := range rand.Perm(len(in)) {
 		out = append(out, in[val])
 		if len(out) >= n {

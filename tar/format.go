@@ -3,22 +3,23 @@ package tarfmt
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"errors"
 	"io"
-	"io/ioutil"
 	"strings"
 
 	importer "github.com/ipfs/go-ipfs/importer"
 	chunk "github.com/ipfs/go-ipfs/importer/chunk"
 	dag "github.com/ipfs/go-ipfs/merkledag"
 	dagutil "github.com/ipfs/go-ipfs/merkledag/utils"
+	path "github.com/ipfs/go-ipfs/path"
 	uio "github.com/ipfs/go-ipfs/unixfs/io"
-	u "github.com/ipfs/go-ipfs/util"
 
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
+	node "gx/ipfs/QmRSU5EqqWVZSNdbU51yXmVoF1uNw3JgTNB6RaiL7DZM16/go-ipld-node"
+	logging "gx/ipfs/QmSpJByNKFX1sCsHBEp3R73FL4NF6FnQTEGyNAXHm2GS52/go-log"
 )
 
-var log = u.Logger("tarfmt")
+var log = logging.Logger("tarfmt")
 
 var blockSize = 512
 var zeroBlock = make([]byte, blockSize)
@@ -33,20 +34,13 @@ func marshalHeader(h *tar.Header) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func ImportTar(r io.Reader, ds dag.DAGService) (*dag.Node, error) {
-	rall, err := ioutil.ReadAll(r)
-	if err != nil {
-		return nil, err
-	}
-
-	r = bytes.NewReader(rall)
-
+func ImportTar(r io.Reader, ds dag.DAGService) (*dag.ProtoNode, error) {
 	tr := tar.NewReader(r)
 
-	root := new(dag.Node)
-	root.Data = []byte("ipfs/tar")
+	root := new(dag.ProtoNode)
+	root.SetData([]byte("ipfs/tar"))
 
-	e := dagutil.NewDagEditor(ds, root)
+	e := dagutil.NewDagEditor(root, ds)
 
 	for {
 		h, err := tr.Next()
@@ -57,18 +51,18 @@ func ImportTar(r io.Reader, ds dag.DAGService) (*dag.Node, error) {
 			return nil, err
 		}
 
-		header := new(dag.Node)
+		header := new(dag.ProtoNode)
 
 		headerBytes, err := marshalHeader(h)
 		if err != nil {
 			return nil, err
 		}
 
-		header.Data = headerBytes
+		header.SetData(headerBytes)
 
 		if h.Size > 0 {
 			spl := chunk.NewRabin(tr, uint64(chunk.DefaultBlockSize))
-			nd, err := importer.BuildDagFromReader(ds, spl, nil)
+			nd, err := importer.BuildDagFromReader(ds, spl)
 			if err != nil {
 				return nil, err
 			}
@@ -85,33 +79,27 @@ func ImportTar(r io.Reader, ds dag.DAGService) (*dag.Node, error) {
 		}
 
 		path := escapePath(h.Name)
-		err = e.InsertNodeAtPath(context.Background(), path, header, func() *dag.Node { return new(dag.Node) })
+		err = e.InsertNodeAtPath(context.Background(), path, header, func() *dag.ProtoNode { return new(dag.ProtoNode) })
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	root = e.GetNode()
-	_, err = ds.Add(root)
-	if err != nil {
-		return nil, err
-	}
-
-	return root, nil
+	return e.Finalize(ds)
 }
 
 // adds a '-' to the beginning of each path element so we can use 'data' as a
 // special link in the structure without having to worry about
-func escapePath(path string) string {
-	elems := strings.Split(strings.Trim(path, "/"), "/")
+func escapePath(pth string) string {
+	elems := path.SplitList(strings.Trim(pth, "/"))
 	for i, e := range elems {
 		elems[i] = "-" + e
 	}
-	return strings.Join(elems, "/")
+	return path.Join(elems)
 }
 
 type tarReader struct {
-	links []*dag.Link
+	links []*node.Link
 	ds    dag.DAGService
 
 	childRead *tarReader
@@ -175,10 +163,15 @@ func (tr *tarReader) Read(b []byte) (int, error) {
 		return 0, err
 	}
 
-	tr.hdrBuf = bytes.NewReader(headerNd.Data)
+	hndpb, ok := headerNd.(*dag.ProtoNode)
+	if !ok {
+		return 0, dag.ErrNotProtobuf
+	}
 
-	dataNd, err := headerNd.GetLinkedNode(tr.ctx, tr.ds, "data")
-	if err != nil && err != dag.ErrNotFound {
+	tr.hdrBuf = bytes.NewReader(hndpb.Data())
+
+	dataNd, err := hndpb.GetLinkedProtoNode(tr.ctx, tr.ds, "data")
+	if err != nil && err != dag.ErrLinkNotFound {
 		return 0, err
 	}
 
@@ -190,9 +183,9 @@ func (tr *tarReader) Read(b []byte) (int, error) {
 		}
 
 		tr.fileRead = &countReader{r: dr}
-	} else if len(headerNd.Links) > 0 {
+	} else if len(headerNd.Links()) > 0 {
 		tr.childRead = &tarReader{
-			links: headerNd.Links,
+			links: headerNd.Links(),
 			ds:    tr.ds,
 			ctx:   tr.ctx,
 		}
@@ -201,12 +194,12 @@ func (tr *tarReader) Read(b []byte) (int, error) {
 	return tr.Read(b)
 }
 
-func ExportTar(ctx context.Context, root *dag.Node, ds dag.DAGService) (io.Reader, error) {
-	if string(root.Data) != "ipfs/tar" {
-		return nil, errors.New("not an ipfs tarchive")
+func ExportTar(ctx context.Context, root *dag.ProtoNode, ds dag.DAGService) (io.Reader, error) {
+	if string(root.Data()) != "ipfs/tar" {
+		return nil, errors.New("not an IPFS tarchive")
 	}
 	return &tarReader{
-		links: root.Links,
+		links: root.Links(),
 		ds:    ds,
 		ctx:   ctx,
 	}, nil

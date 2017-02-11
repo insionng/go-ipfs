@@ -1,16 +1,15 @@
-/*
-Package commands implements the IPFS command interface
-
-Using github.com/ipfs/go-ipfs/commands to define the command line and
-HTTP APIs.  This is the interface available to folks consuming IPFS
-from outside of the Go language.
-*/
+// Package commands implements the ipfs command interface
+//
+// Using github.com/ipfs/go-ipfs/commands to define the command line and HTTP
+// APIs.  This is the interface available to folks using IPFS from outside of
+// the Go language.
 package commands
 
 import (
 	"bytes"
 	"io"
 	"sort"
+	"strings"
 
 	cmds "github.com/ipfs/go-ipfs/commands"
 )
@@ -18,7 +17,16 @@ import (
 type Command struct {
 	Name        string
 	Subcommands []Command
+	Options     []Option
 }
+
+type Option struct {
+	Names []string
+}
+
+const (
+	flagsOptionName = "flags"
+)
 
 // CommandsCmd takes in a root command,
 // and returns a command that lists the subcommands in that root
@@ -28,16 +36,19 @@ func CommandsCmd(root *cmds.Command) *cmds.Command {
 			Tagline:          "List all available commands.",
 			ShortDescription: `Lists all available commands (and subcommands) and exits.`,
 		},
-
+		Options: []cmds.Option{
+			cmds.BoolOption(flagsOptionName, "f", "Show command flags").Default(false),
+		},
 		Run: func(req cmds.Request, res cmds.Response) {
-			root := cmd2outputCmd("ipfs", root)
-			res.SetOutput(&root)
+			rootCmd := cmd2outputCmd("ipfs", root)
+			res.SetOutput(&rootCmd)
 		},
 		Marshalers: cmds.MarshalerMap{
 			cmds.Text: func(res cmds.Response) (io.Reader, error) {
 				v := res.Output().(*Command)
+				showOptions, _, _ := res.Request().Option(flagsOptionName).Bool()
 				buf := new(bytes.Buffer)
-				for _, s := range cmdPathStrings(v) {
+				for _, s := range cmdPathStrings(v, showOptions) {
 					buf.Write([]byte(s + "\n"))
 				}
 				return buf, nil
@@ -48,9 +59,15 @@ func CommandsCmd(root *cmds.Command) *cmds.Command {
 }
 
 func cmd2outputCmd(name string, cmd *cmds.Command) Command {
+	opts := make([]Option, len(cmd.Options))
+	for i, opt := range cmd.Options {
+		opts[i] = Option{opt.Names()}
+	}
+
 	output := Command{
 		Name:        name,
 		Subcommands: make([]Command, len(cmd.Subcommands)),
+		Options:     opts,
 	}
 
 	i := 0
@@ -62,14 +79,29 @@ func cmd2outputCmd(name string, cmd *cmds.Command) Command {
 	return output
 }
 
-func cmdPathStrings(cmd *Command) []string {
+func cmdPathStrings(cmd *Command, showOptions bool) []string {
 	var cmds []string
 
 	var recurse func(prefix string, cmd *Command)
 	recurse = func(prefix string, cmd *Command) {
-		cmds = append(cmds, prefix+cmd.Name)
+		newPrefix := prefix + cmd.Name
+		cmds = append(cmds, newPrefix)
+		if prefix != "" && showOptions {
+			for _, options := range cmd.Options {
+				var cmdOpts []string
+				for _, flag := range options.Names {
+					if len(flag) == 1 {
+						flag = "-" + flag
+					} else {
+						flag = "--" + flag
+					}
+					cmdOpts = append(cmdOpts, newPrefix+" "+flag)
+				}
+				cmds = append(cmds, strings.Join(cmdOpts, " / "))
+			}
+		}
 		for _, sub := range cmd.Subcommands {
-			recurse(prefix+cmd.Name+" ", &sub)
+			recurse(newPrefix+" ", &sub)
 		}
 	}
 

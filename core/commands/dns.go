@@ -6,12 +6,12 @@ import (
 
 	cmds "github.com/ipfs/go-ipfs/commands"
 	namesys "github.com/ipfs/go-ipfs/namesys"
-	util "github.com/ipfs/go-ipfs/util"
+	util "gx/ipfs/Qmb912gdngC1UWwTkhuW8knyRbcWeu5kqkxBpveLmW8bSr/go-ipfs-util"
 )
 
 var DNSCmd = &cmds.Command{
 	Helptext: cmds.HelpText{
-		Tagline: "DNS link resolver",
+		Tagline: "Resolve DNS links.",
 		ShortDescription: `
 Multihashes are hard to remember, but domain names are usually easy to
 remember.  To create memorable aliases for multihashes, DNS TXT
@@ -26,23 +26,20 @@ This command resolves those links to the referenced object.
 
 For example, with this DNS TXT record:
 
-  ipfs.io. TXT "dnslink=/ipfs/QmRzTuh2Lpuz7Gr39stNr6mTFdqAghsZec1JoUnfySUzcy ..."
+	> dig +short TXT _dnslink.ipfs.io
+	dnslink=/ipfs/QmRzTuh2Lpuz7Gr39stNr6mTFdqAghsZec1JoUnfySUzcy
 
 The resolver will give:
 
-  > ipfs dns ipfs.io
-  /ipfs/QmRzTuh2Lpuz7Gr39stNr6mTFdqAghsZec1JoUnfySUzcy
+	> ipfs dns ipfs.io
+	/ipfs/QmRzTuh2Lpuz7Gr39stNr6mTFdqAghsZec1JoUnfySUzcy
 
-And with this DNS TXT record:
+The resolver can recursively resolve:
 
-  ipfs.ipfs.io. TXT "dnslink=/dns/ipfs.io ..."
-
-The resolver will give:
-
-  > ipfs dns ipfs.io
-  /dns/ipfs.io
-  > ipfs dns --recursive
-  /ipfs/QmRzTuh2Lpuz7Gr39stNr6mTFdqAghsZec1JoUnfySUzcy
+	> dig +short TXT recursive.ipfs.io
+	dnslink=/ipns/ipfs.io
+	> ipfs dns -r recursive.ipfs.io
+	/ipfs/QmRzTuh2Lpuz7Gr39stNr6mTFdqAghsZec1JoUnfySUzcy
 `,
 	},
 
@@ -50,7 +47,7 @@ The resolver will give:
 		cmds.StringArg("domain-name", true, false, "The domain-name name to resolve.").EnableStdin(),
 	},
 	Options: []cmds.Option{
-		cmds.BoolOption("recursive", "r", "Resolve until the result is not a DNS link"),
+		cmds.BoolOption("recursive", "r", "Resolve until the result is not a DNS link.").Default(false),
 	},
 	Run: func(req cmds.Request, res cmds.Response) {
 
@@ -75,7 +72,7 @@ The resolver will give:
 			if !ok {
 				return nil, util.ErrCast()
 			}
-			return strings.NewReader(output.Path.String()), nil
+			return strings.NewReader(output.Path.String() + "\n"), nil
 		},
 	},
 	Type: ResolvedPath{},

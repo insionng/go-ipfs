@@ -19,9 +19,22 @@ test_expect_success "ipfs init fails" '
 	test_must_fail ipfs init 2> init_fail_out
 '
 
+# Under Windows/Cygwin the error message is different,
+# so we use the STD_ERR_MSG prereq.
+if test_have_prereq STD_ERR_MSG; then
+	init_err_msg="Error: failed to take lock at $IPFS_PATH: permission denied"
+else
+	init_err_msg="Error: mkdir $IPFS_PATH: The system cannot find the path specified."
+fi
+
 test_expect_success "ipfs init output looks good" '
-	echo "Error: failed to take lock at $IPFS_PATH: permission denied" > init_fail_exp &&
+	echo "$init_err_msg" >init_fail_exp &&
 	test_cmp init_fail_exp init_fail_out
+'
+
+test_expect_success "cleanup dir with bad perms" '
+	chmod 775 "$IPFS_PATH" &&
+	rmdir "$IPFS_PATH"
 '
 
 # test no repo error message
@@ -32,35 +45,34 @@ test_expect_success "ipfs cat fails" '
 '
 
 test_expect_success "ipfs cat no repo message looks good" '
-    echo "Error: no ipfs repo found in $IPFS_PATH." > cat_fail_exp &&
-    echo "please run: ipfs init" >> cat_fail_exp &&
-    test_cmp cat_fail_exp cat_fail_out
+    echo "Error: no IPFS repo found in $IPFS_PATH." > cat_fail_exp &&
+    echo "please run: 'ipfs init'" >> cat_fail_exp &&
+    test_path_cmp cat_fail_exp cat_fail_out
 '
 
 # test that init succeeds
 test_expect_success "ipfs init succeeds" '
 	export IPFS_PATH="$(pwd)/.ipfs" &&
+	echo "IPFS_PATH: \"$IPFS_PATH\"" &&
 	BITS="2048" &&
-	ipfs init --bits="$BITS" >actual_init
+	ipfs init --bits="$BITS" >actual_init ||
+	test_fsh cat actual_init
 '
 
 test_expect_success ".ipfs/ has been created" '
 	test -d ".ipfs" &&
 	test -f ".ipfs/config" &&
 	test -d ".ipfs/datastore" &&
-	test -d ".ipfs/blocks" ||
+	test -d ".ipfs/blocks" &&
+	test ! -f ._check_writeable ||
 	test_fsh ls -al .ipfs
 '
 
 test_expect_success "ipfs config succeeds" '
-	echo leveldb >expected_config &&
-	ipfs config Datastore.Type >actual_config &&
+	echo /ipfs >expected_config &&
+	ipfs config Mounts.IPFS >actual_config &&
 	test_cmp expected_config actual_config
 '
-
-test_check_peerid() {
-	test $(echo "$1" | tr -dC "[:alnum:]" | wc -c | tr -d " ") = "46"
-}
 
 test_expect_success "ipfs peer id looks good" '
 	PEERID=$(ipfs config Identity.PeerID) &&
@@ -69,7 +81,7 @@ test_expect_success "ipfs peer id looks good" '
 
 test_expect_success "ipfs init output looks good" '
 	STARTFILE="ipfs cat /ipfs/$HASH_WELCOME_DOCS/readme" &&
-	echo "initializing ipfs node at $IPFS_PATH" >expected &&
+	echo "initializing IPFS node at $IPFS_PATH" >expected &&
 	echo "generating $BITS-bit RSA keypair...done" >>expected &&
 	echo "peer identity: $PEERID" >>expected &&
 	echo "to get started, enter:" >>expected &&
@@ -96,7 +108,7 @@ test_expect_success "ipfs peer id looks good" '
 '
 
 test_expect_success "'ipfs init --empty-repo' output looks good" '
-	echo "initializing ipfs node at $IPFS_PATH" >expected &&
+	echo "initializing IPFS node at $IPFS_PATH" >expected &&
 	echo "generating $BITS-bit RSA keypair...done" >>expected &&
 	echo "peer identity: $PEERID" >>expected &&
 	test_cmp expected actual_init
@@ -104,6 +116,10 @@ test_expect_success "'ipfs init --empty-repo' output looks good" '
 
 test_expect_success "Welcome readme doesn't exists" '
 	test_must_fail ipfs cat /ipfs/$HASH_WELCOME_DOCS/readme
+'
+
+test_expect_success "ipfs id agent string contains correct version" '
+	ipfs id -f "<aver>" | grep $(ipfs version -n)
 '
 
 test_expect_success "clean up ipfs dir" '

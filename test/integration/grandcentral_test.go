@@ -8,20 +8,19 @@ import (
 	"math"
 	"testing"
 
-	"github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore"
-	syncds "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore/sync"
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
+	context "context"
+	"gx/ipfs/QmRWDav6mzWseLWeYfVd5fvUKiVe9xNH29YfMF438fG364/go-datastore"
+	syncds "gx/ipfs/QmRWDav6mzWseLWeYfVd5fvUKiVe9xNH29YfMF438fG364/go-datastore/sync"
 
-	key "github.com/ipfs/go-ipfs/blocks/key"
 	core "github.com/ipfs/go-ipfs/core"
 	"github.com/ipfs/go-ipfs/core/corerouting"
 	"github.com/ipfs/go-ipfs/core/coreunix"
 	mock "github.com/ipfs/go-ipfs/core/mock"
-	mocknet "github.com/ipfs/go-ipfs/p2p/net/mock"
-	"github.com/ipfs/go-ipfs/p2p/peer"
+	ds2 "github.com/ipfs/go-ipfs/thirdparty/datastore2"
+	testutil "github.com/ipfs/go-ipfs/thirdparty/testutil"
 	"github.com/ipfs/go-ipfs/thirdparty/unit"
-	ds2 "github.com/ipfs/go-ipfs/util/datastore2"
-	testutil "github.com/ipfs/go-ipfs/util/testutil"
+	mocknet "gx/ipfs/QmdzDdLZ7nj133QvNHypyS9Y39g35bMFk5DJ2pmX7YqtKU/go-libp2p/p2p/net/mock"
+	pstore "gx/ipfs/QmeXj9VAjmYQZxpmVz7VzccbJrpmr8qkCDSjfVNsPTWTYU/go-libp2p-peerstore"
 )
 
 func TestSupernodeBootstrappedAddCat(t *testing.T) {
@@ -62,7 +61,7 @@ func RunSupernodeBootstrappedAddCat(data []byte, conf testutil.LatencyConfig) er
 		return err
 	}
 
-	readerCatted, err := coreunix.Cat(catter, keyAdded)
+	readerCatted, err := coreunix.Cat(ctx, catter, keyAdded)
 	if err != nil {
 		return err
 	}
@@ -73,6 +72,7 @@ func RunSupernodeBootstrappedAddCat(data []byte, conf testutil.LatencyConfig) er
 	if 0 != bytes.Compare(bufout.Bytes(), data) {
 		return errors.New("catted data does not match added data")
 	}
+	cancel()
 	return nil
 }
 
@@ -103,7 +103,7 @@ func InitializeSupernodeNetwork(
 		servers = append(servers, bootstrap)
 	}
 
-	var bootstrapInfos []peer.PeerInfo
+	var bootstrapInfos []pstore.PeerInfo
 	for _, n := range servers {
 		info := n.Peerstore.PeerInfo(n.PeerHost.ID())
 		bootstrapInfos = append(bootstrapInfos, info)
@@ -162,7 +162,7 @@ func RunSupernodePutRecordGetRecord(conf testutil.LatencyConfig) error {
 	putter := clients[0]
 	getter := clients[1]
 
-	k := key.Key("key")
+	k := "key"
 	note := []byte("a note from putter")
 
 	if err := putter.Routing.PutValue(ctx, k, note); err != nil {
@@ -177,5 +177,6 @@ func RunSupernodePutRecordGetRecord(conf testutil.LatencyConfig) error {
 	if 0 != bytes.Compare(note, received) {
 		return errors.New("record doesn't match")
 	}
+	cancel()
 	return nil
 }

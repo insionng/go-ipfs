@@ -5,17 +5,13 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 
-	ds "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore"
-	"github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore/flatfs"
-	levelds "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore/leveldb"
-	"github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore/measure"
-	"github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore/mount"
-	ldbopts "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/syndtr/goleveldb/leveldb/opt"
+	"github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/mitchellh/go-homedir"
+	keystore "github.com/ipfs/go-ipfs/keystore"
 	repo "github.com/ipfs/go-ipfs/repo"
 	"github.com/ipfs/go-ipfs/repo/common"
 	config "github.com/ipfs/go-ipfs/repo/config"
@@ -23,14 +19,17 @@ import (
 	mfsr "github.com/ipfs/go-ipfs/repo/fsrepo/migrations"
 	serialize "github.com/ipfs/go-ipfs/repo/fsrepo/serialize"
 	dir "github.com/ipfs/go-ipfs/thirdparty/dir"
-	"github.com/ipfs/go-ipfs/thirdparty/eventlog"
-	u "github.com/ipfs/go-ipfs/util"
-	util "github.com/ipfs/go-ipfs/util"
-	ds2 "github.com/ipfs/go-ipfs/util/datastore2"
+
+	logging "gx/ipfs/QmSpJByNKFX1sCsHBEp3R73FL4NF6FnQTEGyNAXHm2GS52/go-log"
+	ma "gx/ipfs/QmUAQaWbKxGCUTuoQVvvicbQNZ9APF5pDGWyAZSe93AtKH/go-multiaddr"
+	util "gx/ipfs/Qmb912gdngC1UWwTkhuW8knyRbcWeu5kqkxBpveLmW8bSr/go-ipfs-util"
+	"gx/ipfs/QmbUSMTQtK9GRrUbD4ngqJwSzHsquUc8nyDubRWp4vPybH/go-ds-measure"
 )
 
+var log = logging.Logger("fsrepo")
+
 // version number that we are currently expecting to see
-var RepoVersion = "2"
+var RepoVersion = 5
 
 var migrationInstructions = `See https://github.com/ipfs/fs-repo-migrations/blob/master/run.md
 Sorry for the inconvenience. In the future, these will run automatically.`
@@ -40,9 +39,16 @@ Program version is: %s
 Please run the ipfs migration tool before continuing.
 ` + migrationInstructions
 
+var programTooLowMessage = `Your programs version (%d) is lower than your repos (%d).
+Please update ipfs to a version that supports the existing repo, or run
+a migration in reverse.
+
+See https://github.com/ipfs/fs-repo-migrations/blob/master/run.md for details.`
+
 var (
-	ErrNoVersion = errors.New("no version file found, please run 0-to-1 migration tool.\n" + migrationInstructions)
-	ErrOldRepo   = errors.New("ipfs repo found in old '~/.go-ipfs' location, please run migration tool.\n" + migrationInstructions)
+	ErrNoVersion     = errors.New("no version file found, please run 0-to-1 migration tool.\n" + migrationInstructions)
+	ErrOldRepo       = errors.New("ipfs repo found in old '~/.go-ipfs' location, please run migration tool.\n" + migrationInstructions)
+	ErrNeedMigration = errors.New("ipfs repo needs migration.")
 )
 
 type NoRepoError struct {
@@ -52,14 +58,10 @@ type NoRepoError struct {
 var _ error = NoRepoError{}
 
 func (err NoRepoError) Error() string {
-	return fmt.Sprintf("no ipfs repo found in %s.\nplease run: ipfs init", err.Path)
+	return fmt.Sprintf("no IPFS repo found in %s.\nplease run: 'ipfs init'", err.Path)
 }
 
-const (
-	leveldbDirectory = "datastore"
-	flatfsDirectory  = "blocks"
-	apiFile          = "api"
-)
+const apiFile = "api"
 
 var (
 
@@ -93,11 +95,8 @@ type FSRepo struct {
 	// the same fsrepo path concurrently
 	lockfile io.Closer
 	config   *config.Config
-	ds       ds.ThreadSafeDatastore
-	// tracked separately for use in Close; do not use directly.
-	leveldbDS      levelds.Datastore
-	metricsBlocks  measure.DatastoreCloser
-	metricsLevelDB measure.DatastoreCloser
+	ds       repo.Datastore
+	keystore keystore.Keystore
 }
 
 var _ repo.Repo = (*FSRepo)(nil)
@@ -146,8 +145,11 @@ func open(repoPath string) (repo.Repo, error) {
 		return nil, err
 	}
 
-	if ver != RepoVersion {
-		return nil, fmt.Errorf(errIncorrectRepoFmt, ver, RepoVersion)
+	if RepoVersion > ver {
+		return nil, ErrNeedMigration
+	} else if ver > RepoVersion {
+		// program version too low for existing repo
+		return nil, fmt.Errorf(programTooLowMessage, RepoVersion, ver)
 	}
 
 	// check repo path, then check all constituent parts.
@@ -163,15 +165,16 @@ func open(repoPath string) (repo.Repo, error) {
 		return nil, err
 	}
 
-	// setup eventlogger
-	configureEventLoggerAtRepoPath(r.config, r.path)
+	if err := r.openKeystore(); err != nil {
+		return nil, err
+	}
 
 	keepLocked = true
 	return r, nil
 }
 
 func newFSRepo(rpath string) (*FSRepo, error) {
-	expPath, err := u.TildeExpansion(path.Clean(rpath))
+	expPath, err := homedir.Expand(filepath.Clean(rpath))
 	if err != nil {
 		return nil, err
 	}
@@ -253,19 +256,7 @@ func Init(repoPath string, conf *config.Config) error {
 		return err
 	}
 
-	// The actual datastore contents are initialized lazily when Opened.
-	// During Init, we merely check that the directory is writeable.
-	leveldbPath := path.Join(repoPath, leveldbDirectory)
-	if err := dir.Writable(leveldbPath); err != nil {
-		return fmt.Errorf("datastore: %s", err)
-	}
-
-	flatfsPath := path.Join(repoPath, flatfsDirectory)
-	if err := dir.Writable(flatfsPath); err != nil {
-		return fmt.Errorf("datastore: %s", err)
-	}
-
-	if err := dir.Writable(path.Join(repoPath, "logs")); err != nil {
+	if err := initDefaultDatastore(repoPath, conf); err != nil {
 		return err
 	}
 
@@ -276,35 +267,32 @@ func Init(repoPath string, conf *config.Config) error {
 	return nil
 }
 
-// Remove recursively removes the FSRepo at |path|.
-func Remove(repoPath string) error {
-	repoPath = path.Clean(repoPath)
-	return os.RemoveAll(repoPath)
-}
-
 // LockedByOtherProcess returns true if the FSRepo is locked by another
 // process. If true, then the repo cannot be opened by this process.
 func LockedByOtherProcess(repoPath string) (bool, error) {
-	repoPath = path.Clean(repoPath)
-	// NB: the lock is only held when repos are Open
-	return lockfile.Locked(repoPath)
+	repoPath = filepath.Clean(repoPath)
+	locked, err := lockfile.Locked(repoPath)
+	if locked {
+		log.Debugf("(%t)<->Lock is held at %s", locked, repoPath)
+	}
+	return locked, err
 }
 
 // APIAddr returns the registered API addr, according to the api file
 // in the fsrepo. This is a concurrent operation, meaning that any
 // process may read this file. modifying this file, therefore, should
 // use "mv" to replace the whole file and avoid interleaved read/writes.
-func APIAddr(repoPath string) (string, error) {
-	repoPath = path.Clean(repoPath)
-	apiFilePath := path.Join(repoPath, apiFile)
+func APIAddr(repoPath string) (ma.Multiaddr, error) {
+	repoPath = filepath.Clean(repoPath)
+	apiFilePath := filepath.Join(repoPath, apiFile)
 
 	// if there is no file, assume there is no api addr.
 	f, err := os.Open(apiFilePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", repo.ErrApiNotRunning
+			return nil, repo.ErrApiNotRunning
 		}
-		return "", err
+		return nil, err
 	}
 	defer f.Close()
 
@@ -313,23 +301,27 @@ func APIAddr(repoPath string) (string, error) {
 	buf := make([]byte, 2048)
 	n, err := f.Read(buf)
 	if err != nil && err != io.EOF {
-		return "", err
+		return nil, err
 	}
 
 	s := string(buf[:n])
 	s = strings.TrimSpace(s)
-	return s, nil
+	return ma.NewMultiaddr(s)
+}
+
+func (r *FSRepo) Keystore() keystore.Keystore {
+	return r.keystore
 }
 
 // SetAPIAddr writes the API Addr to the /api file.
-func (r *FSRepo) SetAPIAddr(addr string) error {
-	f, err := os.Create(path.Join(r.path, apiFile))
+func (r *FSRepo) SetAPIAddr(addr ma.Multiaddr) error {
+	f, err := os.Create(filepath.Join(r.path, apiFile))
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	_, err = f.WriteString(addr)
+	_, err = f.WriteString(addr.String())
 	return err
 }
 
@@ -347,68 +339,36 @@ func (r *FSRepo) openConfig() error {
 	return nil
 }
 
-// openDatastore returns an error if the config file is not present.
-func (r *FSRepo) openDatastore() error {
-	leveldbPath := path.Join(r.path, leveldbDirectory)
-	var err error
-	// save leveldb reference so it can be neatly closed afterward
-	r.leveldbDS, err = levelds.NewDatastore(leveldbPath, &levelds.Options{
-		Compression: ldbopts.NoCompression,
-	})
+func (r *FSRepo) openKeystore() error {
+	ksp := filepath.Join(r.path, "keystore")
+	ks, err := keystore.NewFSKeystore(ksp)
 	if err != nil {
-		return errors.New("unable to open leveldb datastore")
+		return err
 	}
 
-	// 4TB of 256kB objects ~=17M objects, splitting that 256-way
-	// leads to ~66k objects per dir, splitting 256*256-way leads to
-	// only 256.
-	//
-	// The keys seen by the block store have predictable prefixes,
-	// including "/" from datastore.Key and 2 bytes from multihash. To
-	// reach a uniform 256-way split, we need approximately 4 bytes of
-	// prefix.
-	blocksDS, err := flatfs.New(path.Join(r.path, flatfsDirectory), 4)
-	if err != nil {
-		return errors.New("unable to open flatfs datastore")
-	}
+	r.keystore = ks
 
-	// Add our PeerID to metrics paths to keep them unique
-	//
-	// As some tests just pass a zero-value Config to fsrepo.Init,
-	// cope with missing PeerID.
-	id := r.config.Identity.PeerID
-	if id == "" {
-		// the tests pass in a zero Config; cope with it
-		id = fmt.Sprintf("uninitialized_%p", r)
-	}
-	prefix := "fsrepo." + id + ".datastore."
-	r.metricsBlocks = measure.New(prefix+"blocks", blocksDS)
-	r.metricsLevelDB = measure.New(prefix+"leveldb", r.leveldbDS)
-	mountDS := mount.New([]mount.Mount{
-		{
-			Prefix:    ds.NewKey("/blocks"),
-			Datastore: r.metricsBlocks,
-		},
-		{
-			Prefix:    ds.NewKey("/"),
-			Datastore: r.metricsLevelDB,
-		},
-	})
-	// Make sure it's ok to claim the virtual datastore from mount as
-	// threadsafe. There's no clean way to make mount itself provide
-	// this information without copy-pasting the code into two
-	// variants. This is the same dilemma as the `[].byte` attempt at
-	// introducing const types to Go.
-	var _ ds.ThreadSafeDatastore = blocksDS
-	var _ ds.ThreadSafeDatastore = r.leveldbDS
-	r.ds = ds2.ClaimThreadSafe{mountDS}
 	return nil
 }
 
-func configureEventLoggerAtRepoPath(c *config.Config, repoPath string) {
-	eventlog.Configure(eventlog.LevelInfo)
-	eventlog.Configure(eventlog.LdJSONFormatter)
-	eventlog.Configure(eventlog.Output(eventlog.WriterGroup))
+// openDatastore returns an error if the config file is not present.
+func (r *FSRepo) openDatastore() error {
+	switch r.config.Datastore.Type {
+	case "default", "leveldb", "":
+		d, err := openDefaultDatastore(r)
+		if err != nil {
+			return err
+		}
+		r.ds = d
+	default:
+		return fmt.Errorf("unknown datastore type: %s", r.config.Datastore.Type)
+	}
+
+	// Wrap it with metrics gathering
+	prefix := "ipfs.fsrepo.datastore"
+	r.ds = measure.New(prefix, r.ds)
+
+	return nil
 }
 
 // Close closes the FSRepo, releasing held resources.
@@ -420,13 +380,12 @@ func (r *FSRepo) Close() error {
 		return errors.New("repo is closed")
 	}
 
-	if err := r.metricsBlocks.Close(); err != nil {
-		return err
+	err := os.Remove(filepath.Join(r.path, apiFile))
+	if err != nil && !os.IsNotExist(err) {
+		log.Warning("error removing api file: ", err)
 	}
-	if err := r.metricsLevelDB.Close(); err != nil {
-		return err
-	}
-	if err := r.leveldbDS.Close(); err != nil {
+
+	if err := r.ds.Close(); err != nil {
 		return err
 	}
 
@@ -436,7 +395,7 @@ func (r *FSRepo) Close() error {
 	//
 	// TODO It isn't part of the current contract, but callers may like for us
 	// to disable logging once the component is closed.
-	// eventlog.Configure(eventlog.Output(os.Stderr))
+	// logging.Configure(logging.Output(os.Stderr))
 
 	r.closed = true
 	if err := r.lockfile.Close(); err != nil {
@@ -537,6 +496,14 @@ func (r *FSRepo) SetConfigKey(key string, value interface{}) error {
 		return err
 	}
 
+	// Load private key to guard against it being overwritten.
+	// NOTE: this is a temporary measure to secure this field until we move
+	// keys out of the config file.
+	pkval, err := common.MapGetKV(mapconf, config.PrivKeySelector)
+	if err != nil {
+		return err
+	}
+
 	// Get the type of the value associated with the key
 	oldValue, err := common.MapGetKV(mapconf, key)
 	ok := true
@@ -578,6 +545,11 @@ func (r *FSRepo) SetConfigKey(key string, value interface{}) error {
 		return err
 	}
 
+	// replace private key, in case it was overwritten.
+	if err := common.MapSetKV(mapconf, config.PrivKeySelector, pkval); err != nil {
+		return err
+	}
+
 	// This step doubles as to validate the map against the struct
 	// before serialization
 	conf, err := config.FromMap(mapconf)
@@ -592,11 +564,32 @@ func (r *FSRepo) SetConfigKey(key string, value interface{}) error {
 
 // Datastore returns a repo-owned datastore. If FSRepo is Closed, return value
 // is undefined.
-func (r *FSRepo) Datastore() ds.ThreadSafeDatastore {
+func (r *FSRepo) Datastore() repo.Datastore {
 	packageLock.Lock()
 	d := r.ds
 	packageLock.Unlock()
 	return d
+}
+
+// GetStorageUsage computes the storage space taken by the repo in bytes
+func (r *FSRepo) GetStorageUsage() (uint64, error) {
+	pth, err := config.PathRoot()
+	if err != nil {
+		return 0, err
+	}
+
+	var du uint64
+	err = filepath.Walk(pth, func(p string, f os.FileInfo, err error) error {
+		if err != nil {
+			log.Debugf("filepath.Walk error: %s", err)
+			return nil
+		}
+		if f != nil {
+			du += uint64(f.Size())
+		}
+		return nil
+	})
+	return du, err
 }
 
 var _ io.Closer = &FSRepo{}
@@ -617,11 +610,5 @@ func IsInitialized(path string) bool {
 // isInitializedUnsynced reports whether the repo is initialized. Caller must
 // hold the packageLock.
 func isInitializedUnsynced(repoPath string) bool {
-	if !configIsInitialized(repoPath) {
-		return false
-	}
-	if !util.FileExists(path.Join(repoPath, leveldbDirectory)) {
-		return false
-	}
-	return true
+	return configIsInitialized(repoPath)
 }

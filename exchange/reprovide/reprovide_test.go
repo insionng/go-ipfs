@@ -3,13 +3,13 @@ package reprovide_test
 import (
 	"testing"
 
-	ds "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore"
-	dssync "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore/sync"
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
+	context "context"
 	blocks "github.com/ipfs/go-ipfs/blocks"
 	blockstore "github.com/ipfs/go-ipfs/blocks/blockstore"
 	mock "github.com/ipfs/go-ipfs/routing/mock"
-	testutil "github.com/ipfs/go-ipfs/util/testutil"
+	testutil "github.com/ipfs/go-ipfs/thirdparty/testutil"
+	ds "gx/ipfs/QmRWDav6mzWseLWeYfVd5fvUKiVe9xNH29YfMF438fG364/go-datastore"
+	dssync "gx/ipfs/QmRWDav6mzWseLWeYfVd5fvUKiVe9xNH29YfMF438fG364/go-datastore/sync"
 
 	. "github.com/ipfs/go-ipfs/exchange/reprovide"
 )
@@ -37,7 +37,7 @@ func TestReprovide(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	provs, err := clB.FindProviders(ctx, blk.Key())
+	provs, err := clB.FindProviders(ctx, blk.Cid())
 	if err != nil {
 		t.Fatal(err)
 	}

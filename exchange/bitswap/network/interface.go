@@ -1,14 +1,21 @@
 package network
 
 import (
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
-	key "github.com/ipfs/go-ipfs/blocks/key"
+	"context"
+
 	bsmsg "github.com/ipfs/go-ipfs/exchange/bitswap/message"
-	peer "github.com/ipfs/go-ipfs/p2p/peer"
-	protocol "github.com/ipfs/go-ipfs/p2p/protocol"
+	protocol "gx/ipfs/QmZNkThpqfVXs9GNbexPrfBbXSLNYeKrE7jwFM2oqHbyqN/go-libp2p-protocol"
+	cid "gx/ipfs/QmcTcsTvfaeEBRFo1TkFgT8sRmgi1n1LTZpecfVP8fzpGD/go-cid"
+	peer "gx/ipfs/QmfMmLGoKzCHDN7cGgk64PJr4iipzidDRME8HABSJqvmhC/go-libp2p-peer"
 )
 
-var ProtocolBitswap protocol.ID = "/ipfs/bitswap"
+var (
+	// These two are equivalent, legacy
+	ProtocolBitswapOne    protocol.ID = "/ipfs/bitswap/1.0.0"
+	ProtocolBitswapNoVers protocol.ID = "/ipfs/bitswap"
+
+	ProtocolBitswap protocol.ID = "/ipfs/bitswap/1.1.0"
+)
 
 // BitSwapNetwork provides network connectivity for BitSwap sessions
 type BitSwapNetwork interface {
@@ -25,7 +32,14 @@ type BitSwapNetwork interface {
 
 	ConnectTo(context.Context, peer.ID) error
 
+	NewMessageSender(context.Context, peer.ID) (MessageSender, error)
+
 	Routing
+}
+
+type MessageSender interface {
+	SendMsg(context.Context, bsmsg.BitSwapMessage) error
+	Close() error
 }
 
 // Implement Receiver to receive messages from the BitSwapNetwork
@@ -44,8 +58,8 @@ type Receiver interface {
 
 type Routing interface {
 	// FindProvidersAsync returns a channel of providers for the given key
-	FindProvidersAsync(context.Context, key.Key, int) <-chan peer.ID
+	FindProvidersAsync(context.Context, *cid.Cid, int) <-chan peer.ID
 
 	// Provide provides the key to the network
-	Provide(context.Context, key.Key) error
+	Provide(context.Context, *cid.Cid) error
 }

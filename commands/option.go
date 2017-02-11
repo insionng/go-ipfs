@@ -1,9 +1,11 @@
 package commands
 
 import (
+	"fmt"
 	"reflect"
+	"strings"
 
-	"github.com/ipfs/go-ipfs/util"
+	"gx/ipfs/Qmb912gdngC1UWwTkhuW8knyRbcWeu5kqkxBpveLmW8bSr/go-ipfs-util"
 )
 
 // Types of Command options
@@ -18,15 +20,18 @@ const (
 
 // Option is used to specify a field that will be provided by a consumer
 type Option interface {
-	Names() []string     // a list of unique names matched with user-provided flags
-	Type() reflect.Kind  // value must be this type
-	Description() string // a short string that describes this option
+	Names() []string            // a list of unique names matched with user-provided flags
+	Type() reflect.Kind         // value must be this type
+	Description() string        // a short string that describes this option
+	Default(interface{}) Option // sets the default value of the option
+	DefaultVal() interface{}
 }
 
 type option struct {
 	names       []string
 	kind        reflect.Kind
 	description string
+	defaultVal  interface{}
 }
 
 func (o *option) Names() []string {
@@ -38,6 +43,20 @@ func (o *option) Type() reflect.Kind {
 }
 
 func (o *option) Description() string {
+	if len(o.description) == 0 {
+		return ""
+	}
+	if !strings.HasSuffix(o.description, ".") {
+		o.description += "."
+	}
+	if o.defaultVal != nil {
+		if strings.Contains(o.description, "<<default>>") {
+			return strings.Replace(o.description, "<<default>>",
+				fmt.Sprintf("Default: %v.", o.defaultVal), -1)
+		} else {
+			return fmt.Sprintf("%s Default: %v.", o.description, o.defaultVal)
+		}
+	}
 	return o.description
 }
 
@@ -56,6 +75,15 @@ func NewOption(kind reflect.Kind, names ...string) Option {
 		kind:        kind,
 		description: desc,
 	}
+}
+
+func (o *option) Default(v interface{}) Option {
+	o.defaultVal = v
+	return o
+}
+
+func (o *option) DefaultVal() interface{} {
+	return o.defaultVal
 }
 
 // TODO handle description separately. this will take care of the panic case in
@@ -98,7 +126,7 @@ func (ov OptionValue) Definition() Option {
 
 // value accessor methods, gets the value as a certain type
 func (ov OptionValue) Bool() (value bool, found bool, err error) {
-	if !ov.found {
+	if !ov.found && ov.value == nil {
 		return false, false, nil
 	}
 	val, ok := ov.value.(bool)
@@ -109,7 +137,7 @@ func (ov OptionValue) Bool() (value bool, found bool, err error) {
 }
 
 func (ov OptionValue) Int() (value int, found bool, err error) {
-	if !ov.found {
+	if !ov.found && ov.value == nil {
 		return 0, false, nil
 	}
 	val, ok := ov.value.(int)
@@ -120,7 +148,7 @@ func (ov OptionValue) Int() (value int, found bool, err error) {
 }
 
 func (ov OptionValue) Uint() (value uint, found bool, err error) {
-	if !ov.found {
+	if !ov.found && ov.value == nil {
 		return 0, false, nil
 	}
 	val, ok := ov.value.(uint)
@@ -131,7 +159,7 @@ func (ov OptionValue) Uint() (value uint, found bool, err error) {
 }
 
 func (ov OptionValue) Float() (value float64, found bool, err error) {
-	if !ov.found {
+	if !ov.found && ov.value == nil {
 		return 0, false, nil
 	}
 	val, ok := ov.value.(float64)
@@ -142,7 +170,7 @@ func (ov OptionValue) Float() (value float64, found bool, err error) {
 }
 
 func (ov OptionValue) String() (value string, found bool, err error) {
-	if !ov.found {
+	if !ov.found && ov.value == nil {
 		return "", false, nil
 	}
 	val, ok := ov.value.(string)
@@ -163,8 +191,8 @@ const (
 )
 
 // options that are used by this package
-var OptionEncodingType = StringOption(EncShort, EncLong, "The encoding type the output should be encoded with (json, xml, or text)")
-var OptionRecursivePath = BoolOption(RecShort, RecLong, "Add directory paths recursively")
+var OptionEncodingType = StringOption(EncLong, EncShort, "The encoding type the output should be encoded with (json, xml, or text)")
+var OptionRecursivePath = BoolOption(RecLong, RecShort, "Add directory paths recursively").Default(false)
 var OptionStreamChannels = BoolOption(ChanOpt, "Stream channel output")
 var OptionTimeout = StringOption(TimeoutOpt, "set a global timeout on the command")
 

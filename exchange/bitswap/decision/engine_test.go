@@ -8,14 +8,14 @@ import (
 	"sync"
 	"testing"
 
-	ds "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore"
-	dssync "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore/sync"
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
+	context "context"
 	blocks "github.com/ipfs/go-ipfs/blocks"
 	blockstore "github.com/ipfs/go-ipfs/blocks/blockstore"
 	message "github.com/ipfs/go-ipfs/exchange/bitswap/message"
-	peer "github.com/ipfs/go-ipfs/p2p/peer"
-	testutil "github.com/ipfs/go-ipfs/util/testutil"
+	testutil "github.com/ipfs/go-ipfs/thirdparty/testutil"
+	ds "gx/ipfs/QmRWDav6mzWseLWeYfVd5fvUKiVe9xNH29YfMF438fG364/go-datastore"
+	dssync "gx/ipfs/QmRWDav6mzWseLWeYfVd5fvUKiVe9xNH29YfMF438fG364/go-datastore/sync"
+	peer "gx/ipfs/QmfMmLGoKzCHDN7cGgk64PJr4iipzidDRME8HABSJqvmhC/go-libp2p-peer"
 )
 
 type peerAndEngine struct {
@@ -167,7 +167,7 @@ func partnerWants(e *Engine, keys []string, partner peer.ID) {
 	add := message.New(false)
 	for i, letter := range keys {
 		block := blocks.NewBlock([]byte(letter))
-		add.AddEntry(block.Key(), math.MaxInt32-i)
+		add.AddEntry(block.Cid(), math.MaxInt32-i)
 	}
 	e.MessageReceived(partner, add)
 }
@@ -176,7 +176,7 @@ func partnerCancels(e *Engine, keys []string, partner peer.ID) {
 	cancels := message.New(false)
 	for _, k := range keys {
 		block := blocks.NewBlock([]byte(k))
-		cancels.Cancel(block.Key())
+		cancels.Cancel(block.Cid())
 	}
 	e.MessageReceived(partner, cancels)
 }
@@ -187,8 +187,8 @@ func checkHandledInOrder(t *testing.T, e *Engine, keys []string) error {
 		envelope := <-next
 		received := envelope.Block
 		expected := blocks.NewBlock([]byte(k))
-		if received.Key() != expected.Key() {
-			return errors.New(fmt.Sprintln("received", string(received.Data), "expected", string(expected.Data)))
+		if !received.Cid().Equals(expected.Cid()) {
+			return errors.New(fmt.Sprintln("received", string(received.RawData()), "expected", string(expected.RawData())))
 		}
 	}
 	return nil

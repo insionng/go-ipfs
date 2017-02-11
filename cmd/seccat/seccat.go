@@ -18,10 +18,12 @@ import (
 	"os/signal"
 	"syscall"
 
-	ci "github.com/ipfs/go-ipfs/p2p/crypto"
-	secio "github.com/ipfs/go-ipfs/p2p/crypto/secio"
-	peer "github.com/ipfs/go-ipfs/p2p/peer"
-	u "github.com/ipfs/go-ipfs/util"
+	context "context"
+	logging "gx/ipfs/QmSpJByNKFX1sCsHBEp3R73FL4NF6FnQTEGyNAXHm2GS52/go-log"
+	pstore "gx/ipfs/QmeXj9VAjmYQZxpmVz7VzccbJrpmr8qkCDSjfVNsPTWTYU/go-libp2p-peerstore"
+	secio "gx/ipfs/QmfDU2uJQkxXP6nDTfSPSx4rQt4S4fU4XMRoQA5DzYGWfe/go-libp2p-secio"
+	peer "gx/ipfs/QmfMmLGoKzCHDN7cGgk64PJr4iipzidDRME8HABSJqvmhC/go-libp2p-peer"
+	ci "gx/ipfs/QmfWDLQjGjVe4fr5CoztYW2DYYjRysMJrFe1RCsXLPTf46/go-libp2p-crypto"
 )
 
 var verbose = false
@@ -93,7 +95,7 @@ func main() {
 	args := parseArgs()
 	verbose = args.verbose
 	if args.debug {
-		u.SetDebugLogging()
+		logging.SetDebugLogging()
 	}
 
 	go func() {
@@ -109,7 +111,7 @@ func main() {
 	}
 }
 
-func setupPeer(a args) (peer.ID, peer.Peerstore, error) {
+func setupPeer(a args) (peer.ID, pstore.Peerstore, error) {
 	if a.keybits < 1024 {
 		return "", nil, errors.New("Bitsize less than 1024 is considered unsafe.")
 	}
@@ -125,7 +127,7 @@ func setupPeer(a args) (peer.ID, peer.Peerstore, error) {
 		return "", nil, err
 	}
 
-	ps := peer.NewPeerstore()
+	ps := pstore.NewPeerstore()
 	ps.AddPrivKey(p, sk)
 	ps.AddPubKey(p, pk)
 
@@ -155,7 +157,7 @@ func connect(args args) error {
 	// OK, let's setup the channel.
 	sk := ps.PrivKey(p)
 	sg := secio.SessionGenerator{LocalID: p, PrivateKey: sk}
-	sess, err := sg.NewSession(nil, rwc)
+	sess, err := sg.NewSession(context.TODO(), rwc)
 	if err != nil {
 		return err
 	}

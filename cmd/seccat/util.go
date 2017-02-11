@@ -5,10 +5,10 @@ import (
 	"io"
 	"os"
 
-	eventlog "github.com/ipfs/go-ipfs/thirdparty/eventlog"
+	logging "gx/ipfs/QmSpJByNKFX1sCsHBEp3R73FL4NF6FnQTEGyNAXHm2GS52/go-log"
 )
 
-var log = eventlog.Logger("seccat")
+var log = logging.Logger("seccat")
 
 func exit(format string, vals ...interface{}) {
 	if format != "" {

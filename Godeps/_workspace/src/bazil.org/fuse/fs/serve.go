@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
+	"context"
 )
 
 import (
@@ -774,7 +774,7 @@ func (c *serveConn) serve(r fuse.Request) {
 
 	switch r := r.(type) {
 	default:
-		// Note: To FUSE, ENOSYS means "this server never implements this request."
+		// NOTE: To FUSE, ENOSYS means "this server never implements this request."
 		// It would be inappropriate to return ENOSYS for other operations in this
 		// switch that might only be unavailable in some contexts, not all.
 		done(fuse.ENOSYS)

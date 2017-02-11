@@ -2,23 +2,21 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
+	"net/url"
 	"os"
 	"os/signal"
-	"runtime"
 	"runtime/pprof"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	ma "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-multiaddr"
-	manet "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-multiaddr-net"
-
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
 	cmds "github.com/ipfs/go-ipfs/commands"
 	cmdsCli "github.com/ipfs/go-ipfs/commands/cli"
 	cmdsHttp "github.com/ipfs/go-ipfs/commands/http"
@@ -27,16 +25,22 @@ import (
 	repo "github.com/ipfs/go-ipfs/repo"
 	config "github.com/ipfs/go-ipfs/repo/config"
 	fsrepo "github.com/ipfs/go-ipfs/repo/fsrepo"
-	eventlog "github.com/ipfs/go-ipfs/thirdparty/eventlog"
-	u "github.com/ipfs/go-ipfs/util"
+
+	logging "gx/ipfs/QmSpJByNKFX1sCsHBEp3R73FL4NF6FnQTEGyNAXHm2GS52/go-log"
+	manet "gx/ipfs/QmT6Cp31887FpAc25z25YHgpFJohZedrYLWPPspRtj1Brp/go-multiaddr-net"
+	loggables "gx/ipfs/QmTMy4hVSY28DdwJ9kBz6y7q6MuioFzPcpM3Ma3aPjo1i3/go-libp2p-loggables"
+	ma "gx/ipfs/QmUAQaWbKxGCUTuoQVvvicbQNZ9APF5pDGWyAZSe93AtKH/go-multiaddr"
+	osh "gx/ipfs/QmXuBJ7DR6k3rmUEKtvVMhwjmXDuJgXXPUt4LQXKBMsU93/go-os-helper"
+	u "gx/ipfs/Qmb912gdngC1UWwTkhuW8knyRbcWeu5kqkxBpveLmW8bSr/go-ipfs-util"
 )
 
 // log is the command logger
-var log = eventlog.Logger("cmd/ipfs")
+var log = logging.Logger("cmd/ipfs")
 
 var (
 	errUnexpectedApiOutput = errors.New("api returned unexpected output")
 	errApiVersionMismatch  = errors.New("api version mismatch")
+	errRequestCanceled     = errors.New("request canceled")
 )
 
 const (
@@ -55,14 +59,13 @@ type cmdInvocation struct {
 
 // main roadmap:
 // - parse the commandline to get a cmdInvocation
-// - if user requests, help, print it and exit.
+// - if user requests help, print it and exit.
 // - run the command invocation
 // - output the response
 // - if anything fails, print error, maybe with help
 func main() {
 	rand.Seed(time.Now().UnixNano())
-	runtime.GOMAXPROCS(3) // FIXME rm arbitrary choice for n
-	ctx := eventlog.ContextWithLoggable(context.Background(), eventlog.Uuid("session"))
+	ctx := logging.ContextWithLoggable(context.Background(), loggables.Uuid("session"))
 	var err error
 	var invoc cmdInvocation
 	defer invoc.close()
@@ -98,9 +101,13 @@ func main() {
 	}
 
 	// Handle `ipfs help'
-	if len(os.Args) == 2 && os.Args[1] == "help" {
-		printHelp(false, os.Stdout)
-		os.Exit(0)
+	if len(os.Args) == 2 {
+		if os.Args[1] == "help" {
+			printHelp(false, os.Stdout)
+			os.Exit(0)
+		} else if os.Args[1] == "--version" {
+			os.Args[1] = "version"
+		}
 	}
 
 	// parse the commandline into a command invocation
@@ -129,7 +136,7 @@ func main() {
 		if invoc.cmd != nil {
 			// we need a newline space.
 			fmt.Fprintf(os.Stderr, "\n")
-			printMetaHelp(os.Stderr)
+			printHelp(false, os.Stderr)
 		}
 		os.Exit(1)
 	}
@@ -173,9 +180,12 @@ func (i *cmdInvocation) Run(ctx context.Context) (output io.Reader, err error) {
 	if err != nil {
 		return nil, err
 	}
-	if debug || u.GetenvBool("DEBUG") || os.Getenv("IPFS_LOGGING") == "debug" {
+	if debug || os.Getenv("IPFS_LOGGING") == "debug" {
 		u.Debug = true
-		u.SetDebugLogging()
+		logging.SetDebugLogging()
+	}
+	if u.GetenvBool("DEBUG") {
+		u.Debug = true
 	}
 
 	res, err := callCommand(ctx, i.req, Root, i.cmd)
@@ -215,6 +225,7 @@ func (i *cmdInvocation) constructNodeFunc(ctx context.Context) func() (*core.Ipf
 		if err != nil {
 			return nil, err
 		}
+		n.SetLocal(true)
 		i.node = n
 		return i.node, nil
 	}
@@ -280,7 +291,7 @@ func (i *cmdInvocation) requestedHelp() (short bool, long bool, err error) {
 func callPreCommandHooks(ctx context.Context, details cmdDetails, req cmds.Request, root *cmds.Command) error {
 
 	log.Event(ctx, "callPreCommandHooks", &details)
-	log.Debug("Calling pre-command hooks...")
+	log.Debug("calling pre-command hooks...")
 
 	return nil
 }
@@ -316,18 +327,18 @@ func callCommand(ctx context.Context, req cmds.Request, root *cmds.Command, cmd 
 		}
 	}
 
-	if client != nil {
-		log.Debug("Executing command via API")
+	if client != nil && !cmd.External {
+		log.Debug("executing command via API")
 		res, err = client.Send(req)
 		if err != nil {
 			if isConnRefused(err) {
 				err = repo.ErrApiNotRunning
 			}
-			return nil, err
+			return nil, wrapContextCanceled(err)
 		}
 
 	} else {
-		log.Debug("Executing command locally")
+		log.Debug("executing command locally")
 
 		err := req.SetRootContext(ctx)
 		if err != nil {
@@ -369,7 +380,7 @@ func commandDetails(path []string, root *cmds.Command) (*cmdDetails, error) {
 }
 
 // commandShouldRunOnDaemon determines, from commmand details, whether a
-// command ought to be executed on an IPFS daemon.
+// command ought to be executed on an ipfs daemon.
 //
 // It returns a client if the command should be executed on a daemon and nil if
 // it should be executed on a client. It returns an error if the command must
@@ -411,17 +422,14 @@ func commandShouldRunOnDaemon(details cmdDetails, req cmds.Request, root *cmds.C
 		return nil, err
 	}
 
-	if client != nil { // daemon is running
+	if client != nil {
 		if details.cannotRunOnDaemon {
-			e := "cannot use API with this command."
-
 			// check if daemon locked. legacy error text, for now.
-			daemonLocked, _ := fsrepo.LockedByOtherProcess(req.InvocContext().ConfigRoot)
-			if daemonLocked {
-				e = "ipfs daemon is running. please stop it to run this command"
+			log.Debugf("Command cannot run on daemon. Checking if daemon is locked")
+			if daemonLocked, _ := fsrepo.LockedByOtherProcess(req.InvocContext().ConfigRoot); daemonLocked {
+				return nil, cmds.ClientError("ipfs daemon is running. please stop it to run this command")
 			}
-
-			return nil, cmds.ClientError(e)
+			return nil, nil
 		}
 
 		return client, nil
@@ -582,80 +590,51 @@ func profileIfEnabled() (func(), error) {
 	return func() {}, nil
 }
 
+var apiFileErrorFmt string = `Failed to parse '%[1]s/api' file.
+	error: %[2]s
+If you're sure go-ipfs isn't running, you can just delete it.
+`
+var checkIPFSUnixFmt = "Otherwise check:\n\tps aux | grep ipfs"
+var checkIPFSWinFmt = "Otherwise check:\n\ttasklist | findstr ipfs"
+
 // getApiClient checks the repo, and the given options, checking for
 // a running API service. if there is one, it returns a client.
 // otherwise, it returns errApiNotRunning, or another error.
 func getApiClient(repoPath, apiAddrStr string) (cmdsHttp.Client, error) {
+	var apiErrorFmt string
+	switch {
+	case osh.IsUnix():
+		apiErrorFmt = apiFileErrorFmt + checkIPFSUnixFmt
+	case osh.IsWindows():
+		apiErrorFmt = apiFileErrorFmt + checkIPFSWinFmt
+	default:
+		apiErrorFmt = apiFileErrorFmt
+	}
 
-	if apiAddrStr == "" {
-		var err error
-		if apiAddrStr, err = fsrepo.APIAddr(repoPath); err != nil {
+	var addr ma.Multiaddr
+	var err error
+	if len(apiAddrStr) != 0 {
+		addr, err = ma.NewMultiaddr(apiAddrStr)
+		if err != nil {
 			return nil, err
 		}
-	}
-
-	addr, err := ma.NewMultiaddr(apiAddrStr)
-	if err != nil {
-		return nil, err
-	}
-
-	client, err := apiClientForAddr(addr)
-	if err != nil {
-		return nil, err
-	}
-
-	// make sure the api is actually running.
-	// this is slow, as it might mean an RTT to a remote server.
-	// TODO: optimize some way
-	if err := apiVersionMatches(client); err != nil {
-		return nil, err
-	}
-
-	return client, nil
-}
-
-// apiVersionMatches checks whether the api server is running the
-// same version of go-ipfs. for now, only the exact same version of
-// client + server work. In the future, we should use semver for
-// proper API versioning! \o/
-func apiVersionMatches(client cmdsHttp.Client) (err error) {
-	ver, err := doVersionRequest(client)
-	if err != nil {
-		return err
-	}
-
-	currv := config.CurrentVersionNumber
-	if ver.Version != currv {
-		return fmt.Errorf("%s (%s != %s)", errApiVersionMismatch, ver.Version, currv)
-	}
-	return nil
-}
-
-func doVersionRequest(client cmdsHttp.Client) (*coreCmds.VersionOutput, error) {
-	cmd := coreCmds.VersionCmd
-	optDefs, err := cmd.GetOptions([]string{})
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := cmds.NewRequest([]string{"version"}, nil, nil, nil, cmd, optDefs)
-	if err != nil {
-		return nil, err
-	}
-
-	res, err := client.Send(req)
-	if err != nil {
-		if isConnRefused(err) {
-			err = repo.ErrApiNotRunning
+		if len(addr.Protocols()) == 0 {
+			return nil, fmt.Errorf("mulitaddr doesn't provide any protocols")
 		}
-		return nil, err
-	}
+	} else {
+		addr, err = fsrepo.APIAddr(repoPath)
+		if err == repo.ErrApiNotRunning {
+			return nil, err
+		}
 
-	ver, ok := res.Output().(*coreCmds.VersionOutput)
-	if !ok {
-		return nil, errUnexpectedApiOutput
+		if err != nil {
+			return nil, fmt.Errorf(apiErrorFmt, repoPath, err.Error())
+		}
 	}
-	return ver, nil
+	if len(addr.Protocols()) == 0 {
+		return nil, fmt.Errorf(apiErrorFmt, repoPath, "multiaddr doesn't provide any protocols")
+	}
+	return apiClientForAddr(addr)
 }
 
 func apiClientForAddr(addr ma.Multiaddr) (cmdsHttp.Client, error) {
@@ -668,5 +647,22 @@ func apiClientForAddr(addr ma.Multiaddr) (cmdsHttp.Client, error) {
 }
 
 func isConnRefused(err error) bool {
-	return strings.Contains(err.Error(), "connection refused")
+	// unwrap url errors from http calls
+	if urlerr, ok := err.(*url.Error); ok {
+		err = urlerr.Err
+	}
+
+	netoperr, ok := err.(*net.OpError)
+	if !ok {
+		return false
+	}
+
+	return netoperr.Op == "dial"
+}
+
+func wrapContextCanceled(err error) error {
+	if strings.Contains(err.Error(), "request canceled") {
+		err = errRequestCanceled
+	}
+	return err
 }

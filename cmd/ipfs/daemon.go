@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	_ "expvar"
 	"fmt"
 	"net"
@@ -8,48 +9,63 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"sort"
-	"strings"
 	"sync"
-
-	_ "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/codahale/metrics/runtime"
-	ma "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-multiaddr"
-	"github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-multiaddr-net"
 
 	cmds "github.com/ipfs/go-ipfs/commands"
 	"github.com/ipfs/go-ipfs/core"
 	commands "github.com/ipfs/go-ipfs/core/commands"
 	corehttp "github.com/ipfs/go-ipfs/core/corehttp"
+	corerepo "github.com/ipfs/go-ipfs/core/corerepo"
 	"github.com/ipfs/go-ipfs/core/corerouting"
-	conn "github.com/ipfs/go-ipfs/p2p/net/conn"
-	peer "github.com/ipfs/go-ipfs/p2p/peer"
+	nodeMount "github.com/ipfs/go-ipfs/fuse/node"
 	fsrepo "github.com/ipfs/go-ipfs/repo/fsrepo"
-	util "github.com/ipfs/go-ipfs/util"
+	migrate "github.com/ipfs/go-ipfs/repo/fsrepo/migrations"
+
+	"gx/ipfs/QmR3KwhXCRLTNZB59vELb2HhEWrGy9nuychepxFtj3wWYa/client_golang/prometheus"
+	"gx/ipfs/QmT6Cp31887FpAc25z25YHgpFJohZedrYLWPPspRtj1Brp/go-multiaddr-net"
+	ma "gx/ipfs/QmUAQaWbKxGCUTuoQVvvicbQNZ9APF5pDGWyAZSe93AtKH/go-multiaddr"
+	mprome "gx/ipfs/QmXWro6iddJRbGWUoZDpTu6tjo5EXX4xJHHR9VczeoGZbw/go-metrics-prometheus"
+	util "gx/ipfs/Qmb912gdngC1UWwTkhuW8knyRbcWeu5kqkxBpveLmW8bSr/go-ipfs-util"
+	iconn "gx/ipfs/QmctX4TY6jXtpfeDiwMGoB4qVTBGDnz7T7r22CwQSzTgwt/go-libp2p-interface-conn"
+	pstore "gx/ipfs/QmeXj9VAjmYQZxpmVz7VzccbJrpmr8qkCDSjfVNsPTWTYU/go-libp2p-peerstore"
+
+	_ "gx/ipfs/QmV3NSS3A1kX5s28r7yLczhDsXzkgo65cqRgKFXYunWZmD/metrics/runtime"
 )
 
 const (
+	adjustFDLimitKwd          = "manage-fdlimit"
+	enableGCKwd               = "enable-gc"
 	initOptionKwd             = "init"
-	routingOptionKwd          = "routing"
-	routingOptionSupernodeKwd = "supernode"
-	mountKwd                  = "mount"
-	writableKwd               = "writable"
 	ipfsMountKwd              = "mount-ipfs"
 	ipnsMountKwd              = "mount-ipns"
-	unrestrictedApiAccessKwd  = "unrestricted-api"
+	migrateKwd                = "migrate"
+	mountKwd                  = "mount"
+	offlineKwd                = "offline"
+	routingOptionKwd          = "routing"
+	routingOptionSupernodeKwd = "supernode"
+	routingOptionDHTClientKwd = "dhtclient"
+	routingOptionDHTKwd       = "dht"
+	routingOptionNoneKwd      = "none"
 	unencryptTransportKwd     = "disable-transport-encryption"
+	unrestrictedApiAccessKwd  = "unrestricted-api"
+	writableKwd               = "writable"
+	enableFloodSubKwd         = "enable-pubsub-experiment"
+	enableMultiplexKwd        = "enable-mplex-experiment"
 	// apiAddrKwd    = "address-api"
 	// swarmAddrKwd  = "address-swarm"
 )
 
 var daemonCmd = &cmds.Command{
 	Helptext: cmds.HelpText{
-		Tagline: "Run a network-connected IPFS node",
+		Tagline: "Run a network-connected IPFS node.",
 		ShortDescription: `
-'ipfs daemon' runs a persistent IPFS daemon that can serve commands
+'ipfs daemon' runs a persistent ipfs daemon that can serve commands
 over the network. Most applications that use IPFS will do so by
 communicating with a daemon over the HTTP API. While the daemon is
 running, calls to 'ipfs' commands will be sent over the network to
 the daemon.
-
+`,
+		LongDescription: `
 The daemon will start listening on ports on the network, which are
 documented in (and can be modified through) 'ipfs config Addresses'.
 For example, to change the 'Gateway' port:
@@ -74,7 +90,7 @@ make sure to protect the port as you would other services or database
 
 HTTP Headers
 
-IPFS supports passing arbitrary headers to the API and Gateway. You can
+ipfs supports passing arbitrary headers to the API and Gateway. You can
 do this by setting headers on the API.HTTPHeaders and Gateway.HTTPHeaders
 keys:
 
@@ -89,31 +105,63 @@ CORS Headers (for API)
 
 You can setup CORS headers the same way:
 
-	ipfs config --json API.HTTPHeaders.Access-Control-Allow-Origin '["*"]'
+	ipfs config --json API.HTTPHeaders.Access-Control-Allow-Origin '["example.com"]'
 	ipfs config --json API.HTTPHeaders.Access-Control-Allow-Methods '["PUT", "GET", "POST"]'
 	ipfs config --json API.HTTPHeaders.Access-Control-Allow-Credentials '["true"]'
 
+Shutdown
+
+To shutdown the daemon, send a SIGINT signal to it (e.g. by pressing 'Ctrl-C')
+or send a SIGTERM signal to it (e.g. with 'kill'). It may take a while for the
+daemon to shutdown gracefully, but it can be killed forcibly by sending a
+second signal.
+
+IPFS_PATH environment variable
+
+ipfs uses a repository in the local file system. By default, the repo is
+located at ~/.ipfs. To change the repo location, set the $IPFS_PATH
+environment variable:
+
+    export IPFS_PATH=/path/to/ipfsrepo
+
+Routing
+
+IPFS by default will use a DHT for content routing. There is a highly
+experimental alternative that operates the DHT in a 'client only' mode that can
+be enabled by running the daemon as:
+
+    ipfs daemon --routing=dhtclient
+
+This will later be transitioned into a config option once it gets out of the
+'experimental' stage.
 
 DEPRECATION NOTICE
 
-Previously, IPFS used an environment variable as seen below:
+Previously, ipfs used an environment variable as seen below:
 
    export API_ORIGIN="http://localhost:8888/"
 
-This is deprecated. It is still honored in this version, but will be removed in a
-future version, along with this notice. Please move to setting the HTTP Headers.
+This is deprecated. It is still honored in this version, but will be removed
+in a future version, along with this notice. Please move to setting the HTTP
+Headers.
 `,
 	},
 
 	Options: []cmds.Option{
-		cmds.BoolOption(initOptionKwd, "Initialize IPFS with default settings if not already initialized"),
-		cmds.StringOption(routingOptionKwd, "Overrides the routing option (dht, supernode)"),
-		cmds.BoolOption(mountKwd, "Mounts IPFS to the filesystem"),
-		cmds.BoolOption(writableKwd, "Enable writing objects (with POST, PUT and DELETE)"),
-		cmds.StringOption(ipfsMountKwd, "Path to the mountpoint for IPFS (if using --mount)"),
-		cmds.StringOption(ipnsMountKwd, "Path to the mountpoint for IPNS (if using --mount)"),
-		cmds.BoolOption(unrestrictedApiAccessKwd, "Allow API access to unlisted hashes"),
-		cmds.BoolOption(unencryptTransportKwd, "Disable transport encryption (for debugging protocols)"),
+		cmds.BoolOption(initOptionKwd, "Initialize ipfs with default settings if not already initialized").Default(false),
+		cmds.StringOption(routingOptionKwd, "Overrides the routing option").Default("dht"),
+		cmds.BoolOption(mountKwd, "Mounts IPFS to the filesystem").Default(false),
+		cmds.BoolOption(writableKwd, "Enable writing objects (with POST, PUT and DELETE)").Default(false),
+		cmds.StringOption(ipfsMountKwd, "Path to the mountpoint for IPFS (if using --mount). Defaults to config setting."),
+		cmds.StringOption(ipnsMountKwd, "Path to the mountpoint for IPNS (if using --mount). Defaults to config setting."),
+		cmds.BoolOption(unrestrictedApiAccessKwd, "Allow API access to unlisted hashes").Default(false),
+		cmds.BoolOption(unencryptTransportKwd, "Disable transport encryption (for debugging protocols)").Default(false),
+		cmds.BoolOption(enableGCKwd, "Enable automatic periodic repo garbage collection").Default(false),
+		cmds.BoolOption(adjustFDLimitKwd, "Check and raise file descriptor limits if needed").Default(true),
+		cmds.BoolOption(offlineKwd, "Run offline. Do not connect to the rest of the network but provide local API.").Default(false),
+		cmds.BoolOption(migrateKwd, "If true, assume yes at the migrate prompt. If false, assume no."),
+		cmds.BoolOption(enableFloodSubKwd, "Instantiate the ipfs daemon with the experimental pubsub feature enabled."),
+		cmds.BoolOption(enableMultiplexKwd, "Add the experimental 'go-multiplex' stream muxer to libp2p on construction."),
 
 		// TODO: add way to override addresses. tricky part: updating the config if also --init.
 		// cmds.StringOption(apiAddrKwd, "Address for the daemon rpc API (overrides config)"),
@@ -134,9 +182,25 @@ func defaultMux(path string) corehttp.ServeOption {
 	}
 }
 
+var fileDescriptorCheck = func() error { return nil }
+
 func daemonFunc(req cmds.Request, res cmds.Response) {
+	// Inject metrics before we do anything
+
+	err := mprome.Inject()
+	if err != nil {
+		log.Errorf("Injecting prometheus handler for metrics failed with message: %s\n", err.Error())
+	}
+
 	// let the user know we're going.
 	fmt.Printf("Initializing daemon...\n")
+
+	managefd, _, _ := req.Option(adjustFDLimitKwd).Bool()
+	if managefd {
+		if err := fileDescriptorCheck(); err != nil {
+			log.Errorf("setting file descriptor limit: %s", err)
+		}
+	}
 
 	ctx := req.InvocContext()
 
@@ -144,6 +208,7 @@ func daemonFunc(req cmds.Request, res cmds.Response) {
 		select {
 		case <-req.Context().Done():
 			fmt.Println("Received interrupt signal, shutting down...")
+			fmt.Println("(Hit ctrl-c again to force-shutdown the daemon.)")
 		}
 	}()
 
@@ -152,7 +217,7 @@ func daemonFunc(req cmds.Request, res cmds.Response) {
 	if unencrypted {
 		log.Warningf(`Running with --%s: All connections are UNENCRYPTED.
 		You will not be able to connect to regular encrypted networks.`, unencryptTransportKwd)
-		conn.EncryptConnections = false
+		iconn.EncryptConnections = false
 	}
 
 	// first, whether user has provided the initialization flag. we may be
@@ -165,7 +230,7 @@ func daemonFunc(req cmds.Request, res cmds.Response) {
 
 	if initialize {
 
-		// now, FileExists is our best method of detecting whether IPFS is
+		// now, FileExists is our best method of detecting whether ipfs is
 		// configured. Consider moving this into a config helper method
 		// `IsInitialized` where the quality of the signal can be improved over
 		// time, and many call-sites can benefit.
@@ -181,9 +246,42 @@ func daemonFunc(req cmds.Request, res cmds.Response) {
 	// acquire the repo lock _before_ constructing a node. we need to make
 	// sure we are permitted to access the resources (datastore, etc.)
 	repo, err := fsrepo.Open(req.InvocContext().ConfigRoot)
-	if err != nil {
+	switch err {
+	default:
 		res.SetError(err, cmds.ErrNormal)
 		return
+	case fsrepo.ErrNeedMigration:
+		domigrate, found, _ := req.Option(migrateKwd).Bool()
+		fmt.Println("Found outdated fs-repo, migrations need to be run.")
+
+		if !found {
+			domigrate = YesNoPrompt("Run migrations now? [y/N]")
+		}
+
+		if !domigrate {
+			fmt.Println("Not running migrations of fs-repo now.")
+			fmt.Println("Please get fs-repo-migrations from https://dist.ipfs.io")
+			res.SetError(fmt.Errorf("fs-repo requires migration"), cmds.ErrNormal)
+			return
+		}
+
+		err = migrate.RunMigration(fsrepo.RepoVersion)
+		if err != nil {
+			fmt.Println("The migrations of fs-repo failed:")
+			fmt.Printf("  %s\n", err)
+			fmt.Println("If you think this is a bug, please file an issue and include this whole log output.")
+			fmt.Println("  https://github.com/ipfs/fs-repo-migrations")
+			res.SetError(err, cmds.ErrNormal)
+			return
+		}
+
+		repo, err = fsrepo.Open(req.InvocContext().ConfigRoot)
+		if err != nil {
+			res.SetError(err, cmds.ErrNormal)
+			return
+		}
+	case nil:
+		break
 	}
 
 	cfg, err := ctx.GetConfig()
@@ -192,10 +290,20 @@ func daemonFunc(req cmds.Request, res cmds.Response) {
 		return
 	}
 
+	offline, _, _ := req.Option(offlineKwd).Bool()
+	pubsub, _, _ := req.Option(enableFloodSubKwd).Bool()
+	mplex, _, _ := req.Option(enableMultiplexKwd).Bool()
+
 	// Start assembling node config
 	ncfg := &core.BuildCfg{
-		Online: true,
-		Repo:   repo,
+		Repo:      repo,
+		Permament: true, // It is temporary way to signify that node is permament
+		Online:    !offline,
+		ExtraOpts: map[string]bool{
+			"pubsub": pubsub,
+			"mplex":  mplex,
+		},
+		//TODO(Kubuxu): refactor Online vs Offline by adding Permanent vs Ephemeral
 	}
 
 	routingOption, _, err := req.Option(routingOptionKwd).String()
@@ -203,22 +311,32 @@ func daemonFunc(req cmds.Request, res cmds.Response) {
 		res.SetError(err, cmds.ErrNormal)
 		return
 	}
-	if routingOption == routingOptionSupernodeKwd {
+	switch routingOption {
+	case routingOptionSupernodeKwd:
 		servers, err := cfg.SupernodeRouting.ServerIPFSAddrs()
 		if err != nil {
 			res.SetError(err, cmds.ErrNormal)
 			repo.Close() // because ownership hasn't been transferred to the node
 			return
 		}
-		var infos []peer.PeerInfo
+		var infos []pstore.PeerInfo
 		for _, addr := range servers {
-			infos = append(infos, peer.PeerInfo{
+			infos = append(infos, pstore.PeerInfo{
 				ID:    addr.ID(),
 				Addrs: []ma.Multiaddr{addr.Transport()},
 			})
 		}
 
 		ncfg.Routing = corerouting.SupernodeClient(infos...)
+	case routingOptionDHTClientKwd:
+		ncfg.Routing = core.DHTClientOption
+	case routingOptionDHTKwd:
+		ncfg.Routing = core.DHTOption
+	case routingOptionNoneKwd:
+		ncfg.Routing = core.NilRouterOption
+	default:
+		res.SetError(fmt.Errorf("unrecognized routing option: %s", routingOption), cmds.ErrNormal)
+		return
 	}
 
 	node, err := core.NewNode(req.Context(), ncfg)
@@ -227,6 +345,7 @@ func daemonFunc(req cmds.Request, res cmds.Response) {
 		res.SetError(err, cmds.ErrNormal)
 		return
 	}
+	node.SetLocal(false)
 
 	printSwarmAddrs(node)
 
@@ -270,6 +389,11 @@ func daemonFunc(req cmds.Request, res cmds.Response) {
 		res.SetError(err, cmds.ErrNormal)
 		return
 	}
+	if mount && offline {
+		res.SetError(errors.New("mount is not currently supported in offline mode"),
+			cmds.ErrClient)
+		return
+	}
 	if mount {
 		if err := mountFuse(req); err != nil {
 			res.SetError(err, cmds.ErrNormal)
@@ -277,15 +401,26 @@ func daemonFunc(req cmds.Request, res cmds.Response) {
 		}
 	}
 
+	// repo blockstore GC - if --enable-gc flag is present
+	err, gcErrc := maybeRunGC(req, node)
+	if err != nil {
+		res.SetError(err, cmds.ErrNormal)
+		return
+	}
+
+	// initialize metrics collector
+	prometheus.MustRegister(&corehttp.IpfsNodeCollector{Node: node})
+
 	fmt.Printf("Daemon is ready\n")
 	// collect long-running errors and block for shutdown
 	// TODO(cryptix): our fuse currently doesnt follow this pattern for graceful shutdown
-	for err := range merge(apiErrc, gwErrc) {
+	for err := range merge(apiErrc, gwErrc, gcErrc) {
 		if err != nil {
+			log.Error(err)
 			res.SetError(err, cmds.ErrNormal)
-			return
 		}
 	}
+	return
 }
 
 // serveHTTPApi collects options, creates listener, prints status message and starts serving requests
@@ -315,37 +450,29 @@ func serveHTTPApi(req cmds.Request) (error, <-chan error) {
 	apiMaddr = apiLis.Multiaddr()
 	fmt.Printf("API server listening on %s\n", apiMaddr)
 
+	// by default, we don't let you load arbitrary ipfs objects through the api,
+	// because this would open up the api to scripting vulnerabilities.
+	// only the webui objects are allowed.
+	// if you know what you're doing, go ahead and pass --unrestricted-api.
 	unrestricted, _, err := req.Option(unrestrictedApiAccessKwd).Bool()
 	if err != nil {
 		return fmt.Errorf("serveHTTPApi: Option(%s) failed: %s", unrestrictedApiAccessKwd, err), nil
 	}
+	gatewayOpt := corehttp.GatewayOption(false, corehttp.WebUIPaths...)
+	if unrestricted {
+		gatewayOpt = corehttp.GatewayOption(true, "/ipfs", "/ipns")
+	}
 
-	apiGw := corehttp.NewGateway(corehttp.GatewayConfig{
-		Writable: true,
-		BlockList: &corehttp.BlockList{
-			Decider: func(s string) bool {
-				if unrestricted {
-					return true
-				}
-				// for now, only allow paths in the WebUI path
-				for _, webuipath := range corehttp.WebUIPaths {
-					if strings.HasPrefix(s, webuipath) {
-						return true
-					}
-				}
-				return false
-			},
-		},
-	})
 	var opts = []corehttp.ServeOption{
+		corehttp.MetricsCollectionOption("api"),
 		corehttp.CommandsOption(*req.InvocContext()),
 		corehttp.WebUIOption,
-		apiGw.ServeOption(),
+		gatewayOpt,
 		corehttp.VersionOption(),
 		defaultMux("/debug/vars"),
 		defaultMux("/debug/pprof/"),
+		corehttp.MetricsScrapingOption("/debug/metrics/prometheus"),
 		corehttp.LogOption(),
-		corehttp.PrometheusOption("/debug/metrics/prometheus"),
 	}
 
 	if len(cfg.Gateway.RootRedirect) > 0 {
@@ -357,7 +484,7 @@ func serveHTTPApi(req cmds.Request) (error, <-chan error) {
 		return fmt.Errorf("serveHTTPApi: ConstructNode() failed: %s", err), nil
 	}
 
-	if err := node.Repo.SetAPIAddr(apiAddr); err != nil {
+	if err := node.Repo.SetAPIAddr(apiMaddr); err != nil {
 		return fmt.Errorf("serveHTTPApi: SetAPIAddr() failed: %s", err), nil
 	}
 
@@ -371,6 +498,10 @@ func serveHTTPApi(req cmds.Request) (error, <-chan error) {
 
 // printSwarmAddrs prints the addresses of the host
 func printSwarmAddrs(node *core.IpfsNode) {
+	if !node.OnlineMode() {
+		fmt.Println("Swarm not listening, running in offline mode.")
+		return
+	}
 	var addrs []string
 	for _, addr := range node.PeerHost.Addrs() {
 		addrs = append(addrs, addr.String())
@@ -416,10 +547,11 @@ func serveHTTPGateway(req cmds.Request) (error, <-chan error) {
 	}
 
 	var opts = []corehttp.ServeOption{
+		corehttp.MetricsCollectionOption("gateway"),
 		corehttp.CommandsROOption(*req.InvocContext()),
 		corehttp.VersionOption(),
 		corehttp.IPNSHostnameOption(),
-		corehttp.GatewayOption(writable),
+		corehttp.GatewayOption(writable, "/ipfs", "/ipns"),
 	}
 
 	if len(cfg.Gateway.RootRedirect) > 0 {
@@ -467,13 +599,30 @@ func mountFuse(req cmds.Request) error {
 		return fmt.Errorf("mountFuse: ConstructNode() failed: %s", err)
 	}
 
-	err = commands.Mount(node, fsdir, nsdir)
+	err = nodeMount.Mount(node, fsdir, nsdir)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("IPFS mounted at: %s\n", fsdir)
 	fmt.Printf("IPNS mounted at: %s\n", nsdir)
 	return nil
+}
+
+func maybeRunGC(req cmds.Request, node *core.IpfsNode) (error, <-chan error) {
+	enableGC, _, err := req.Option(enableGCKwd).Bool()
+	if err != nil {
+		return err, nil
+	}
+	if !enableGC {
+		return nil, nil
+	}
+
+	errc := make(chan error)
+	go func() {
+		errc <- corerepo.PeriodicGC(req.Context(), node)
+		close(errc)
+	}()
+	return nil, errc
 }
 
 // merge does fan-in of multiple read-only error channels
@@ -504,4 +653,23 @@ func merge(cs ...<-chan error) <-chan error {
 		close(out)
 	}()
 	return out
+}
+
+func YesNoPrompt(prompt string) bool {
+	var s string
+	for i := 0; i < 3; i++ {
+		fmt.Printf("%s ", prompt)
+		fmt.Scanf("%s", &s)
+		switch s {
+		case "y", "Y":
+			return true
+		case "n", "N":
+			return false
+		case "":
+			return false
+		}
+		fmt.Println("Please press either 'y' or 'n'")
+	}
+
+	return false
 }

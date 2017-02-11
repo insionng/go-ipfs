@@ -4,14 +4,14 @@ import (
 	"sync"
 	"testing"
 
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
+	context "context"
 	blocks "github.com/ipfs/go-ipfs/blocks"
 	bsmsg "github.com/ipfs/go-ipfs/exchange/bitswap/message"
 	bsnet "github.com/ipfs/go-ipfs/exchange/bitswap/network"
-	peer "github.com/ipfs/go-ipfs/p2p/peer"
 	mockrouting "github.com/ipfs/go-ipfs/routing/mock"
 	delay "github.com/ipfs/go-ipfs/thirdparty/delay"
-	testutil "github.com/ipfs/go-ipfs/util/testutil"
+	testutil "github.com/ipfs/go-ipfs/thirdparty/testutil"
+	peer "gx/ipfs/QmfMmLGoKzCHDN7cGgk64PJr4iipzidDRME8HABSJqvmhC/go-libp2p-peer"
 )
 
 func TestSendMessageAsyncButWaitForResponse(t *testing.T) {
@@ -44,7 +44,7 @@ func TestSendMessageAsyncButWaitForResponse(t *testing.T) {
 		// TODO assert that this came from the correct peer and that the message contents are as expected
 		ok := false
 		for _, b := range msgFromResponder.Blocks() {
-			if string(b.Data) == expectedStr {
+			if string(b.RawData()) == expectedStr {
 				wg.Done()
 				ok = true
 			}

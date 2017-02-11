@@ -5,9 +5,9 @@ import (
 	"net/http"
 	"strings"
 
-	isd "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-is-domain"
-	"github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
+	"context"
 	"github.com/ipfs/go-ipfs/core"
+	isd "gx/ipfs/QmaeHSCBd9XjXxmgHEiKkHtLcMCb2eZsPLKT7bHgBfBkqw/go-is-domain"
 )
 
 // IPNSHostnameOption rewrites an incoming request if its Host: header contains
@@ -24,7 +24,7 @@ func IPNSHostnameOption() ServeOption {
 			if len(host) > 0 && isd.IsDomain(host) {
 				name := "/ipns/" + host
 				if _, err := n.Namesys.Resolve(ctx, name); err == nil {
-					r.Header["X-IPNS-Original-Path"] = []string{r.URL.Path}
+					r.Header["X-Ipns-Original-Path"] = []string{r.URL.Path}
 					r.URL.Path = name + r.URL.Path
 				}
 			}

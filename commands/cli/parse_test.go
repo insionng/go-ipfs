@@ -4,6 +4,7 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -77,6 +78,9 @@ func TestOptionParsing(t *testing.T) {
 	}
 
 	testHelper := func(args string, expectedOpts kvs, expectedWords words, expectErr bool) {
+		var opts map[string]interface{}
+		var input []string
+
 		_, opts, input, _, err := parseOpts(strings.Split(args, " "), cmd)
 		if expectErr {
 			if err == nil {
@@ -98,28 +102,45 @@ func TestOptionParsing(t *testing.T) {
 		testHelper(args, expectedOpts, expectedWords, false)
 	}
 
-	test("-", kvs{}, words{"-"})
+	test("test -", kvs{}, words{"-"})
 	testFail("-b -b")
-	test("beep boop", kvs{}, words{"beep", "boop"})
 	test("test beep boop", kvs{}, words{"beep", "boop"})
 	testFail("-s")
 	test("-s foo", kvs{"s": "foo"}, words{})
 	test("-sfoo", kvs{"s": "foo"}, words{})
 	test("-s=foo", kvs{"s": "foo"}, words{})
-	test("-b", kvs{"b": ""}, words{})
-	test("-bs foo", kvs{"b": "", "s": "foo"}, words{})
+	test("-b", kvs{"b": true}, words{})
+	test("-bs foo", kvs{"b": true, "s": "foo"}, words{})
 	test("-sb", kvs{"s": "b"}, words{})
-	test("-b foo", kvs{"b": ""}, words{"foo"})
-	test("--bool foo", kvs{"bool": ""}, words{"foo"})
+	test("-b test foo", kvs{"b": true}, words{"foo"})
+	test("--bool test foo", kvs{"bool": true}, words{"foo"})
 	testFail("--bool=foo")
 	testFail("--string")
 	test("--string foo", kvs{"string": "foo"}, words{})
 	test("--string=foo", kvs{"string": "foo"}, words{})
 	test("-- -b", kvs{}, words{"-b"})
-	test("foo -b", kvs{"b": ""}, words{"foo"})
+	test("test foo -b", kvs{"b": true}, words{"foo"})
+	test("-b=false", kvs{"b": false}, words{})
+	test("-b=true", kvs{"b": true}, words{})
+	test("-b=false test foo", kvs{"b": false}, words{"foo"})
+	test("-b=true test foo", kvs{"b": true}, words{"foo"})
+	test("--bool=true test foo", kvs{"bool": true}, words{"foo"})
+	test("--bool=false test foo", kvs{"bool": false}, words{"foo"})
+	test("-b test true", kvs{"b": true}, words{"true"})
+	test("-b test false", kvs{"b": true}, words{"false"})
+	test("-b=FaLsE test foo", kvs{"b": false}, words{"foo"})
+	test("-b=TrUe test foo", kvs{"b": true}, words{"foo"})
+	test("-b test true", kvs{"b": true}, words{"true"})
+	test("-b test false", kvs{"b": true}, words{"false"})
+	test("-b --string foo test bar", kvs{"b": true, "string": "foo"}, words{"bar"})
+	test("-b=false --string bar", kvs{"b": false, "string": "bar"}, words{})
+	testFail("foo test")
 }
 
 func TestArgumentParsing(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("stdin handling doesnt yet work on windows")
+	}
 	rootCmd := &commands.Command{
 		Subcommands: map[string]*commands.Command{
 			"noarg": {},
@@ -196,7 +217,7 @@ func TestArgumentParsing(t *testing.T) {
 		}
 	}
 
-	testFail := func(cmd words, msg string) {
+	testFail := func(cmd words, fi *os.File, msg string) {
 		_, _, _, err := Parse(cmd, nil, rootCmd)
 		if err == nil {
 			t.Errorf("Should have failed: %v", msg)
@@ -204,18 +225,18 @@ func TestArgumentParsing(t *testing.T) {
 	}
 
 	test([]string{"noarg"}, nil, []string{})
-	testFail([]string{"noarg", "value!"}, "provided an arg, but command didn't define any")
+	testFail([]string{"noarg", "value!"}, nil, "provided an arg, but command didn't define any")
 
 	test([]string{"onearg", "value!"}, nil, []string{"value!"})
-	testFail([]string{"onearg"}, "didn't provide any args, arg is required")
+	testFail([]string{"onearg"}, nil, "didn't provide any args, arg is required")
 
 	test([]string{"twoargs", "value1", "value2"}, nil, []string{"value1", "value2"})
-	testFail([]string{"twoargs", "value!"}, "only provided 1 arg, needs 2")
-	testFail([]string{"twoargs"}, "didn't provide any args, 2 required")
+	testFail([]string{"twoargs", "value!"}, nil, "only provided 1 arg, needs 2")
+	testFail([]string{"twoargs"}, nil, "didn't provide any args, 2 required")
 
 	test([]string{"variadic", "value!"}, nil, []string{"value!"})
 	test([]string{"variadic", "value1", "value2", "value3"}, nil, []string{"value1", "value2", "value3"})
-	testFail([]string{"variadic"}, "didn't provide any args, 1 required")
+	testFail([]string{"variadic"}, nil, "didn't provide any args, 1 required")
 
 	test([]string{"optional", "value!"}, nil, []string{"value!"})
 	test([]string{"optional"}, nil, []string{})
@@ -223,14 +244,14 @@ func TestArgumentParsing(t *testing.T) {
 
 	test([]string{"optionalsecond", "value!"}, nil, []string{"value!"})
 	test([]string{"optionalsecond", "value1", "value2"}, nil, []string{"value1", "value2"})
-	testFail([]string{"optionalsecond"}, "didn't provide any args, 1 required")
-	testFail([]string{"optionalsecond", "value1", "value2", "value3"}, "provided too many args, takes 2 maximum")
+	testFail([]string{"optionalsecond"}, nil, "didn't provide any args, 1 required")
+	testFail([]string{"optionalsecond", "value1", "value2", "value3"}, nil, "provided too many args, takes 2 maximum")
 
 	test([]string{"reversedoptional", "value1", "value2"}, nil, []string{"value1", "value2"})
 	test([]string{"reversedoptional", "value!"}, nil, []string{"value!"})
 
-	testFail([]string{"reversedoptional"}, "didn't provide any args, 1 required")
-	testFail([]string{"reversedoptional", "value1", "value2", "value3"}, "provided too many args, only takes 1")
+	testFail([]string{"reversedoptional"}, nil, "didn't provide any args, 1 required")
+	testFail([]string{"reversedoptional", "value1", "value2", "value3"}, nil, "provided too many args, only takes 1")
 
 	// Use a temp file to simulate stdin
 	fileToSimulateStdin := func(t *testing.T, content string) *os.File {
@@ -280,6 +301,7 @@ func TestArgumentParsing(t *testing.T) {
 	fstdin = fileToSimulateStdin(t, "stdin1")
 	test([]string{"stdinenablednotvariadic2args", "value1"}, fstdin, []string{"value1", "stdin1"})
 	test([]string{"stdinenablednotvariadic2args", "value1", "value2"}, fstdin, []string{"value1", "value2"})
+	testFail([]string{"stdinenablednotvariadic2args"}, fstdin, "cant use stdin for non stdin arg")
 
 	fstdin = fileToSimulateStdin(t, "stdin1")
 	test([]string{"noarg"}, fstdin, []string{})

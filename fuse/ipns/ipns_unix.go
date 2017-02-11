@@ -5,25 +5,35 @@
 package ipns
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 
 	fuse "github.com/ipfs/go-ipfs/Godeps/_workspace/src/bazil.org/fuse"
 	fs "github.com/ipfs/go-ipfs/Godeps/_workspace/src/bazil.org/fuse/fs"
-	"github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
-	eventlog "github.com/ipfs/go-ipfs/thirdparty/eventlog"
 
-	key "github.com/ipfs/go-ipfs/blocks/key"
 	core "github.com/ipfs/go-ipfs/core"
-	nsfs "github.com/ipfs/go-ipfs/ipnsfs"
 	dag "github.com/ipfs/go-ipfs/merkledag"
-	ci "github.com/ipfs/go-ipfs/p2p/crypto"
+	mfs "github.com/ipfs/go-ipfs/mfs"
+	path "github.com/ipfs/go-ipfs/path"
 	ft "github.com/ipfs/go-ipfs/unixfs"
+
+	logging "gx/ipfs/QmSpJByNKFX1sCsHBEp3R73FL4NF6FnQTEGyNAXHm2GS52/go-log"
+	cid "gx/ipfs/QmcTcsTvfaeEBRFo1TkFgT8sRmgi1n1LTZpecfVP8fzpGD/go-cid"
+	peer "gx/ipfs/QmfMmLGoKzCHDN7cGgk64PJr4iipzidDRME8HABSJqvmhC/go-libp2p-peer"
+	ci "gx/ipfs/QmfWDLQjGjVe4fr5CoztYW2DYYjRysMJrFe1RCsXLPTf46/go-libp2p-crypto"
 )
 
-var log = eventlog.Logger("fuse/ipns")
+func init() {
+	if os.Getenv("IPFS_FUSE_DEBUG") != "" {
+		fuse.Debug = func(msg interface{}) {
+			fmt.Println(msg)
+		}
+	}
+}
+
+var log = logging.Logger("fuse/ipns")
 
 // FileSystem is the readwrite IPNS Fuse Filesystem.
 type FileSystem struct {
@@ -33,16 +43,21 @@ type FileSystem struct {
 
 // NewFileSystem constructs new fs using given core.IpfsNode instance.
 func NewFileSystem(ipfs *core.IpfsNode, sk ci.PrivKey, ipfspath, ipnspath string) (*FileSystem, error) {
-	root, err := CreateRoot(ipfs, []ci.PrivKey{sk}, ipfspath, ipnspath)
+
+	kmap := map[string]ci.PrivKey{
+		"local": sk,
+	}
+	root, err := CreateRoot(ipfs, kmap, ipfspath, ipnspath)
 	if err != nil {
 		return nil, err
 	}
+
 	return &FileSystem{Ipfs: ipfs, RootNode: root}, nil
 }
 
 // Root constructs the Root of the filesystem, a Root object.
 func (f *FileSystem) Root() (fs.Node, error) {
-	log.Debug("Filesystem, get root")
+	log.Debug("filesystem, get root")
 	return f.RootNode, nil
 }
 
@@ -56,60 +71,107 @@ func (f *FileSystem) Destroy() {
 // Root is the root object of the filesystem tree.
 type Root struct {
 	Ipfs *core.IpfsNode
-	Keys []ci.PrivKey
+	Keys map[string]ci.PrivKey
 
 	// Used for symlinking into ipfs
 	IpfsRoot  string
 	IpnsRoot  string
 	LocalDirs map[string]fs.Node
-	Roots     map[string]*nsfs.KeyRoot
+	Roots     map[string]*keyRoot
 
-	fs        *nsfs.Filesystem
-	LocalLink *Link
+	LocalLinks map[string]*Link
 }
 
-func CreateRoot(ipfs *core.IpfsNode, keys []ci.PrivKey, ipfspath, ipnspath string) (*Root, error) {
+func ipnsPubFunc(ipfs *core.IpfsNode, k ci.PrivKey) mfs.PubFunc {
+	return func(ctx context.Context, c *cid.Cid) error {
+		return ipfs.Namesys.Publish(ctx, k, path.FromCid(c))
+	}
+}
+
+func loadRoot(ctx context.Context, rt *keyRoot, ipfs *core.IpfsNode, name string) (fs.Node, error) {
+	p, err := path.ParsePath("/ipns/" + name)
+	if err != nil {
+		log.Errorf("mkpath %s: %s", name, err)
+		return nil, err
+	}
+
+	node, err := core.Resolve(ctx, ipfs.Namesys, ipfs.Resolver, p)
+	if err != nil {
+		log.Errorf("looking up %s: %s", p, err)
+		return nil, err
+	}
+
+	pbnode, ok := node.(*dag.ProtoNode)
+	if !ok {
+		return nil, dag.ErrNotProtobuf
+	}
+
+	root, err := mfs.NewRoot(ctx, ipfs.DAG, pbnode, ipnsPubFunc(ipfs, rt.k))
+	if err != nil {
+		return nil, err
+	}
+
+	rt.root = root
+
+	switch val := root.GetValue().(type) {
+	case *mfs.Directory:
+		return &Directory{dir: val}, nil
+	case *mfs.File:
+		return &FileNode{fi: val}, nil
+	default:
+		return nil, errors.New("unrecognized type")
+	}
+
+	panic("not reached")
+}
+
+type keyRoot struct {
+	k     ci.PrivKey
+	alias string
+	root  *mfs.Root
+}
+
+func CreateRoot(ipfs *core.IpfsNode, keys map[string]ci.PrivKey, ipfspath, ipnspath string) (*Root, error) {
 	ldirs := make(map[string]fs.Node)
-	roots := make(map[string]*nsfs.KeyRoot)
-	for _, k := range keys {
-		pkh, err := k.GetPublic().Hash()
+	roots := make(map[string]*keyRoot)
+	links := make(map[string]*Link)
+	for alias, k := range keys {
+		pid, err := peer.IDFromPrivateKey(k)
 		if err != nil {
 			return nil, err
 		}
-		name := key.Key(pkh).B58String()
-		root, err := ipfs.IpnsFs.GetRoot(name)
+		name := pid.Pretty()
+
+		kr := &keyRoot{k: k, alias: alias}
+		fsn, err := loadRoot(ipfs.Context(), kr, ipfs, name)
 		if err != nil {
 			return nil, err
 		}
 
-		roots[name] = root
+		roots[name] = kr
+		ldirs[name] = fsn
 
-		switch val := root.GetValue().(type) {
-		case *nsfs.Directory:
-			ldirs[name] = &Directory{dir: val}
-		case *nsfs.File:
-			ldirs[name] = &File{fi: val}
-		default:
-			return nil, errors.New("unrecognized type")
+		// set up alias symlink
+		links[alias] = &Link{
+			Target: name,
 		}
 	}
 
 	return &Root{
-		fs:        ipfs.IpnsFs,
-		Ipfs:      ipfs,
-		IpfsRoot:  ipfspath,
-		IpnsRoot:  ipnspath,
-		Keys:      keys,
-		LocalDirs: ldirs,
-		LocalLink: &Link{ipfs.Identity.Pretty()},
-		Roots:     roots,
+		Ipfs:       ipfs,
+		IpfsRoot:   ipfspath,
+		IpnsRoot:   ipnspath,
+		Keys:       keys,
+		LocalDirs:  ldirs,
+		LocalLinks: links,
+		Roots:      roots,
 	}, nil
 }
 
 // Attr returns file attributes.
 func (*Root) Attr(ctx context.Context, a *fuse.Attr) error {
 	log.Debug("Root Attr")
-	*a = fuse.Attr{Mode: os.ModeDir | 0111} // -rw+x
+	a.Mode = os.ModeDir | 0111 // -rw+x
 	return nil
 }
 
@@ -121,12 +183,8 @@ func (s *Root) Lookup(ctx context.Context, name string) (fs.Node, error) {
 		return nil, fuse.ENOENT
 	}
 
-	// Local symlink to the node ID keyspace
-	if name == "local" {
-		if s.LocalLink == nil {
-			return nil, fuse.ENOENT
-		}
-		return s.LocalLink, nil
+	if lnk, ok := s.LocalLinks[name]; ok {
+		return lnk, nil
 	}
 
 	nd, ok := s.LocalDirs[name]
@@ -134,7 +192,7 @@ func (s *Root) Lookup(ctx context.Context, name string) (fs.Node, error) {
 		switch nd := nd.(type) {
 		case *Directory:
 			return nd, nil
-		case *File:
+		case *FileNode:
 			return nd, nil
 		default:
 			return nil, fuse.EIO
@@ -150,17 +208,17 @@ func (s *Root) Lookup(ctx context.Context, name string) (fs.Node, error) {
 
 	segments := resolved.Segments()
 	if segments[0] == "ipfs" {
-		p := strings.Join(resolved.Segments()[1:], "/")
+		p := path.Join(resolved.Segments()[1:])
 		return &Link{s.IpfsRoot + "/" + p}, nil
-	} else {
-		log.Error("Invalid path.Path: ", resolved)
-		return nil, errors.New("invalid path from ipns record")
 	}
+
+	log.Error("Invalid path.Path: ", resolved)
+	return nil, errors.New("invalid path from ipns record")
 }
 
 func (r *Root) Close() error {
-	for _, kr := range r.Roots {
-		err := kr.Publish(r.Ipfs.Context())
+	for _, mr := range r.Roots {
+		err := mr.root.Close()
 		if err != nil {
 			return err
 		}
@@ -181,66 +239,61 @@ func (r *Root) Forget() {
 // as well as a symlink to the peerID key
 func (r *Root) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	log.Debug("Root ReadDirAll")
-	listing := []fuse.Dirent{
-		{
-			Name: "local",
-			Type: fuse.DT_Link,
-		},
-	}
-	for _, k := range r.Keys {
-		pub := k.GetPublic()
-		hash, err := pub.Hash()
+
+	var listing []fuse.Dirent
+	for alias, k := range r.Keys {
+		pid, err := peer.IDFromPrivateKey(k)
 		if err != nil {
 			continue
 		}
 		ent := fuse.Dirent{
-			Name: key.Key(hash).Pretty(),
+			Name: pid.Pretty(),
 			Type: fuse.DT_Dir,
 		}
-		listing = append(listing, ent)
+		link := fuse.Dirent{
+			Name: alias,
+			Type: fuse.DT_Link,
+		}
+		listing = append(listing, ent, link)
 	}
 	return listing, nil
 }
 
-// Directory is wrapper over an ipnsfs directory to satisfy the fuse fs interface
+// Directory is wrapper over an mfs directory to satisfy the fuse fs interface
 type Directory struct {
-	dir *nsfs.Directory
-
-	fs.NodeRef
+	dir *mfs.Directory
 }
 
-// File is wrapper over an ipnsfs file to satisfy the fuse fs interface
-type File struct {
-	fi *nsfs.File
+type FileNode struct {
+	fi *mfs.File
+}
 
-	fs.NodeRef
+// File is wrapper over an mfs file to satisfy the fuse fs interface
+type File struct {
+	fi mfs.FileDescriptor
 }
 
 // Attr returns the attributes of a given node.
 func (d *Directory) Attr(ctx context.Context, a *fuse.Attr) error {
 	log.Debug("Directory Attr")
-	*a = fuse.Attr{
-		Mode: os.ModeDir | 0555,
-		Uid:  uint32(os.Getuid()),
-		Gid:  uint32(os.Getgid()),
-	}
+	a.Mode = os.ModeDir | 0555
+	a.Uid = uint32(os.Getuid())
+	a.Gid = uint32(os.Getgid())
 	return nil
 }
 
 // Attr returns the attributes of a given node.
-func (fi *File) Attr(ctx context.Context, a *fuse.Attr) error {
+func (fi *FileNode) Attr(ctx context.Context, a *fuse.Attr) error {
 	log.Debug("File Attr")
 	size, err := fi.fi.Size()
 	if err != nil {
 		// In this case, the dag node in question may not be unixfs
 		return fmt.Errorf("fuse/ipns: failed to get file.Size(): %s", err)
 	}
-	*a = fuse.Attr{
-		Mode: os.FileMode(0666),
-		Size: uint64(size),
-		Uid:  uint32(os.Getuid()),
-		Gid:  uint32(os.Getgid()),
-	}
+	a.Mode = os.FileMode(0666)
+	a.Size = uint64(size)
+	a.Uid = uint32(os.Getuid())
+	a.Gid = uint32(os.Getgid())
 	return nil
 }
 
@@ -253,10 +306,10 @@ func (s *Directory) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	}
 
 	switch child := child.(type) {
-	case *nsfs.Directory:
+	case *mfs.Directory:
 		return &Directory{dir: child}, nil
-	case *nsfs.File:
-		return &File{fi: child}, nil
+	case *mfs.File:
+		return &FileNode{fi: child}, nil
 	default:
 		// NB: if this happens, we do not want to continue, unpredictable behaviour
 		// may occur.
@@ -267,19 +320,17 @@ func (s *Directory) Lookup(ctx context.Context, name string) (fs.Node, error) {
 // ReadDirAll reads the link structure as directory entries
 func (dir *Directory) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	var entries []fuse.Dirent
-	for _, name := range dir.dir.List() {
-		dirent := fuse.Dirent{Name: name}
+	listing, err := dir.dir.List()
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range listing {
+		dirent := fuse.Dirent{Name: entry.Name}
 
-		// TODO: make dir.dir.List() return dirinfos
-		child, err := dir.dir.Child(name)
-		if err != nil {
-			return nil, err
-		}
-
-		switch child.Type() {
-		case nsfs.TDir:
+		switch mfs.NodeType(entry.Type) {
+		case mfs.TDir:
 			dirent.Type = fuse.DT_Dir
-		case nsfs.TFile:
+		case mfs.TFile:
 			dirent.Type = fuse.DT_File
 		}
 
@@ -328,7 +379,7 @@ func (fi *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wr
 func (fi *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 	errs := make(chan error, 1)
 	go func() {
-		errs <- fi.fi.Close()
+		errs <- fi.fi.Flush()
 	}()
 	select {
 	case err := <-errs:
@@ -339,14 +390,16 @@ func (fi *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 }
 
 func (fi *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
-	cursize, err := fi.fi.Size()
-	if err != nil {
-		return err
-	}
-	if cursize != int64(req.Size) {
-		err := fi.fi.Truncate(int64(req.Size))
+	if req.Valid.Size() {
+		cursize, err := fi.fi.Size()
 		if err != nil {
 			return err
+		}
+		if cursize != int64(req.Size) {
+			err := fi.fi.Truncate(int64(req.Size))
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -354,7 +407,7 @@ func (fi *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fus
 
 // Fsync flushes the content in the file to disk, but does not
 // update the dag tree internally
-func (fi *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
+func (fi *FileNode) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
 	errs := make(chan error, 1)
 	go func() {
 		errs <- fi.fi.Sync()
@@ -370,7 +423,7 @@ func (fi *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
 func (fi *File) Forget() {
 	err := fi.fi.Sync()
 	if err != nil {
-		log.Debug("Forget file error: ", err)
+		log.Debug("forget file error: ", err)
 	}
 }
 
@@ -383,25 +436,49 @@ func (dir *Directory) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Nod
 	return &Directory{dir: child}, nil
 }
 
-func (fi *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
+func (fi *FileNode) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
+	var mfsflag int
+	switch {
+	case req.Flags.IsReadOnly():
+		mfsflag = mfs.OpenReadOnly
+	case req.Flags.IsWriteOnly():
+		mfsflag = mfs.OpenWriteOnly
+	case req.Flags.IsReadWrite():
+		mfsflag = mfs.OpenReadWrite
+	default:
+		return nil, errors.New("unsupported flag type")
+	}
+
+	fd, err := fi.fi.Open(mfsflag, true)
+	if err != nil {
+		return nil, err
+	}
+
 	if req.Flags&fuse.OpenTruncate != 0 {
+		if req.Flags.IsReadOnly() {
+			log.Error("tried to open a readonly file with truncate")
+			return nil, fuse.ENOTSUP
+		}
 		log.Info("Need to truncate file!")
-		err := fi.fi.Truncate(0)
+		err := fd.Truncate(0)
 		if err != nil {
 			return nil, err
 		}
 	} else if req.Flags&fuse.OpenAppend != 0 {
 		log.Info("Need to append to file!")
+		if req.Flags.IsReadOnly() {
+			log.Error("tried to open a readonly file with append")
+			return nil, fuse.ENOTSUP
+		}
 
-		// seek(0) essentially resets the file object, this is required for appends to work
-		// properly
-		_, err := fi.fi.Seek(0, os.SEEK_SET)
+		_, err := fd.Seek(0, os.SEEK_END)
 		if err != nil {
 			log.Error("seek reset failed: ", err)
 			return nil, err
 		}
 	}
-	return fi, nil
+
+	return &File{fi: fd}, nil
 }
 
 func (fi *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
@@ -410,7 +487,7 @@ func (fi *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 
 func (dir *Directory) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
 	// New 'empty' file
-	nd := &dag.Node{Data: ft.FilePBData(nil, 0)}
+	nd := dag.NodeWithData(ft.FilePBData(nil, 0))
 	err := dir.dir.AddChild(req.Name, nd)
 	if err != nil {
 		return nil, nil, err
@@ -421,13 +498,31 @@ func (dir *Directory) Create(ctx context.Context, req *fuse.CreateRequest, resp 
 		return nil, nil, err
 	}
 
-	fi, ok := child.(*nsfs.File)
+	fi, ok := child.(*mfs.File)
 	if !ok {
 		return nil, nil, errors.New("child creation failed")
 	}
 
-	nodechild := &File{fi: fi}
-	return nodechild, nodechild, nil
+	nodechild := &FileNode{fi: fi}
+
+	var openflag int
+	switch {
+	case req.Flags.IsReadOnly():
+		openflag = mfs.OpenReadOnly
+	case req.Flags.IsWriteOnly():
+		openflag = mfs.OpenWriteOnly
+	case req.Flags.IsReadWrite():
+		openflag = mfs.OpenReadWrite
+	default:
+		return nil, nil, errors.New("unsupported open mode")
+	}
+
+	fd, err := fi.Open(openflag, true)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return nodechild, &File{fi: fd}, nil
 }
 
 func (dir *Directory) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
@@ -461,7 +556,7 @@ func (dir *Directory) Rename(ctx context.Context, req *fuse.RenameRequest, newDi
 		if err != nil {
 			return err
 		}
-	case *File:
+	case *FileNode:
 		log.Error("Cannot move node into a file!")
 		return fuse.EPERM
 	default:
@@ -504,9 +599,13 @@ type ipnsFile interface {
 	fs.HandleReader
 	fs.HandleWriter
 	fs.HandleReleaser
+}
+
+type ipnsFileNode interface {
 	fs.Node
 	fs.NodeFsyncer
 	fs.NodeOpener
 }
 
+var _ ipnsFileNode = (*FileNode)(nil)
 var _ ipnsFile = (*File)(nil)

@@ -4,6 +4,7 @@ package readonly
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
@@ -12,18 +13,19 @@ import (
 	"sync"
 	"testing"
 
-	fstest "github.com/ipfs/go-ipfs/Godeps/_workspace/src/bazil.org/fuse/fs/fstestutil"
-
-	key "github.com/ipfs/go-ipfs/blocks/key"
 	core "github.com/ipfs/go-ipfs/core"
 	coreunix "github.com/ipfs/go-ipfs/core/coreunix"
 	coremock "github.com/ipfs/go-ipfs/core/mock"
 	importer "github.com/ipfs/go-ipfs/importer"
 	chunk "github.com/ipfs/go-ipfs/importer/chunk"
 	dag "github.com/ipfs/go-ipfs/merkledag"
+	ci "github.com/ipfs/go-ipfs/thirdparty/testutil/ci"
 	uio "github.com/ipfs/go-ipfs/unixfs/io"
-	u "github.com/ipfs/go-ipfs/util"
-	ci "github.com/ipfs/go-ipfs/util/testutil/ci"
+
+	fstest "github.com/ipfs/go-ipfs/Godeps/_workspace/src/bazil.org/fuse/fs/fstestutil"
+	node "gx/ipfs/QmRSU5EqqWVZSNdbU51yXmVoF1uNw3JgTNB6RaiL7DZM16/go-ipld-node"
+	u "gx/ipfs/Qmb912gdngC1UWwTkhuW8knyRbcWeu5kqkxBpveLmW8bSr/go-ipfs-util"
+	cid "gx/ipfs/QmcTcsTvfaeEBRFo1TkFgT8sRmgi1n1LTZpecfVP8fzpGD/go-cid"
 )
 
 func maybeSkipFuseTests(t *testing.T) {
@@ -32,11 +34,11 @@ func maybeSkipFuseTests(t *testing.T) {
 	}
 }
 
-func randObj(t *testing.T, nd *core.IpfsNode, size int64) (*dag.Node, []byte) {
+func randObj(t *testing.T, nd *core.IpfsNode, size int64) (node.Node, []byte) {
 	buf := make([]byte, size)
 	u.NewTimeSeededRand().Read(buf)
 	read := bytes.NewReader(buf)
-	obj, err := importer.BuildTrickleDagFromReader(nd.DAG, chunk.DefaultSplitter(read), nil)
+	obj, err := importer.BuildTrickleDagFromReader(nd.DAG, chunk.DefaultSplitter(read))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,11 +75,7 @@ func TestIpfsBasicRead(t *testing.T) {
 	defer mnt.Close()
 
 	fi, data := randObj(t, nd, 10000)
-	k, err := fi.Key()
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	k := fi.Cid()
 	fname := path.Join(mnt.Dir, k.String())
 	rbuf, err := ioutil.ReadFile(fname)
 	if err != nil {
@@ -89,17 +87,23 @@ func TestIpfsBasicRead(t *testing.T) {
 	}
 }
 
-func getPaths(t *testing.T, ipfs *core.IpfsNode, name string, n *dag.Node) []string {
-	if len(n.Links) == 0 {
+func getPaths(t *testing.T, ipfs *core.IpfsNode, name string, n *dag.ProtoNode) []string {
+	if len(n.Links()) == 0 {
 		return []string{name}
 	}
 	var out []string
-	for _, lnk := range n.Links {
+	for _, lnk := range n.Links() {
 		child, err := lnk.GetNode(ipfs.Context(), ipfs.DAG)
 		if err != nil {
 			t.Fatal(err)
 		}
-		sub := getPaths(t, ipfs, path.Join(name, lnk.Name), child)
+
+		childpb, ok := child.(*dag.ProtoNode)
+		if !ok {
+			t.Fatal(dag.ErrNotProtobuf)
+		}
+
+		sub := getPaths(t, ipfs, path.Join(name, lnk.Name), childpb)
 		out = append(out, sub...)
 	}
 	return out
@@ -113,7 +117,7 @@ func TestIpfsStressRead(t *testing.T) {
 	nd, mnt := setupIpfsTest(t, nil)
 	defer mnt.Close()
 
-	var ks []key.Key
+	var ks []*cid.Cid
 	var paths []string
 
 	nobj := 50
@@ -122,13 +126,9 @@ func TestIpfsStressRead(t *testing.T) {
 	// Make a bunch of objects
 	for i := 0; i < nobj; i++ {
 		fi, _ := randObj(t, nd, rand.Int63n(50000))
-		k, err := fi.Key()
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		ks = append(ks, k)
-		paths = append(paths, k.String())
+		c := fi.Cid()
+		ks = append(ks, c)
+		paths = append(paths, c.String())
 	}
 
 	// Now make a bunch of dirs
@@ -154,6 +154,7 @@ func TestIpfsStressRead(t *testing.T) {
 
 	// Now read a bunch, concurrently
 	wg := sync.WaitGroup{}
+	errs := make(chan error)
 
 	for s := 0; s < 4; s++ {
 		wg.Add(1)
@@ -165,26 +166,36 @@ func TestIpfsStressRead(t *testing.T) {
 				fname := path.Join(mnt.Dir, item)
 				rbuf, err := ioutil.ReadFile(fname)
 				if err != nil {
-					t.Fatal(err)
+					errs <- err
 				}
 
-				read, err := coreunix.Cat(nd, item)
+				read, err := coreunix.Cat(nd.Context(), nd, item)
 				if err != nil {
-					t.Fatal(err)
+					errs <- err
 				}
 
 				data, err := ioutil.ReadAll(read)
 				if err != nil {
-					t.Fatal(err)
+					errs <- err
 				}
 
 				if !bytes.Equal(rbuf, data) {
-					t.Fatal("Incorrect Read!")
+					errs <- errors.New("Incorrect Read!")
 				}
 			}
 		}()
 	}
-	wg.Wait()
+
+	go func() {
+		wg.Wait()
+		close(errs)
+	}()
+
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 // Test writing a file and reading it back
@@ -197,14 +208,11 @@ func TestIpfsBasicDirRead(t *testing.T) {
 
 	// Make a 'file'
 	fi, data := randObj(t, nd, 10000)
-	k, err := fi.Key()
-	if err != nil {
-		t.Fatal(err)
-	}
+	k := fi.Cid()
 
 	// Make a directory and put that file in it
 	db := uio.NewDirectory(nd.DAG)
-	err = db.AddChild(nd.Context(), "actual", k)
+	err := db.AddChild(nd.Context(), "actual", k)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,10 +255,7 @@ func TestFileSizeReporting(t *testing.T) {
 	defer mnt.Close()
 
 	fi, data := randObj(t, nd, 10000)
-	k, err := fi.Key()
-	if err != nil {
-		t.Fatal(err)
-	}
+	k := fi.Cid()
 
 	fname := path.Join(mnt.Dir, k.String())
 

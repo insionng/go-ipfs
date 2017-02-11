@@ -9,26 +9,28 @@ import (
 	"path/filepath"
 	"strings"
 
-	u "github.com/ipfs/go-ipfs/util"
+	"github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/mitchellh/go-homedir"
+	logging "gx/ipfs/QmSpJByNKFX1sCsHBEp3R73FL4NF6FnQTEGyNAXHm2GS52/go-log"
 )
 
-var log = u.Logger("config")
+var log = logging.Logger("config")
 
-// Config is used to load IPFS config files.
+// Config is used to load ipfs config files.
 type Config struct {
 	Identity         Identity              // local node's peer identity
 	Datastore        Datastore             // local node's storage
 	Addresses        Addresses             // local node's addresses
 	Mounts           Mounts                // local node's mount points
-	Version          Version               // local node's version management
 	Discovery        Discovery             // local node's discovery mechanisms
+	Ipns             Ipns                  // Ipns settings
 	Bootstrap        []string              // local nodes's bootstrap peer addresses
 	Tour             Tour                  // local node's tour position
 	Gateway          Gateway               // local node's gateway server options
 	SupernodeRouting SupernodeClientConfig // local node's routing servers (if SupernodeRouting enabled)
 	API              API                   // local node's API settings
 	Swarm            SwarmConfig
-	Log              Log
+
+	Reprovider Reprovider
 }
 
 const (
@@ -47,7 +49,7 @@ func PathRoot() (string, error) {
 	dir := os.Getenv(EnvDir)
 	var err error
 	if len(dir) == 0 {
-		dir, err = u.TildeExpansion(DefaultPathRoot)
+		dir, err = homedir.Expand(DefaultPathRoot)
 	}
 	return dir, err
 }

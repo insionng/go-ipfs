@@ -5,7 +5,7 @@ import (
 	"io"
 	"testing"
 
-	u "github.com/ipfs/go-ipfs/util"
+	u "gx/ipfs/Qmb912gdngC1UWwTkhuW8knyRbcWeu5kqkxBpveLmW8bSr/go-ipfs-util"
 )
 
 func randBuf(t *testing.T, size int) []byte {

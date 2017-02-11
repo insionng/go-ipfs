@@ -1,28 +1,26 @@
 package dagutils
 
 import (
-	"strings"
 	"testing"
 
-	key "github.com/ipfs/go-ipfs/blocks/key"
 	dag "github.com/ipfs/go-ipfs/merkledag"
 	mdtest "github.com/ipfs/go-ipfs/merkledag/test"
+	path "github.com/ipfs/go-ipfs/path"
 
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
+	context "context"
+	cid "gx/ipfs/QmcTcsTvfaeEBRFo1TkFgT8sRmgi1n1LTZpecfVP8fzpGD/go-cid"
 )
 
 func TestAddLink(t *testing.T) {
 	ds := mdtest.Mock()
-	fishnode := &dag.Node{
-		Data: []byte("fishcakes!"),
-	}
+	fishnode := dag.NodeWithData([]byte("fishcakes!"))
 
 	fk, err := ds.Add(fishnode)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	nd := new(dag.Node)
+	nd := new(dag.ProtoNode)
 	nnode, err := addLink(context.Background(), ds, nd, "fish", fishnode)
 	if err != nil {
 		t.Fatal(err)
@@ -33,21 +31,17 @@ func TestAddLink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fnpkey, err := fnprime.Key()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if fnpkey != fk {
+	fnpkey := fnprime.Cid()
+	if !fnpkey.Equals(fk) {
 		t.Fatal("wrong child node found!")
 	}
 }
 
-func assertNodeAtPath(t *testing.T, ds dag.DAGService, root *dag.Node, path string, exp key.Key) {
-	parts := strings.Split(path, "/")
+func assertNodeAtPath(t *testing.T, ds dag.DAGService, root *dag.ProtoNode, pth string, exp *cid.Cid) {
+	parts := path.SplitList(pth)
 	cur := root
 	for _, e := range parts {
-		nxt, err := cur.GetLinkedNode(context.Background(), ds, e)
+		nxt, err := cur.GetLinkedProtoNode(context.Background(), ds, e)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -55,24 +49,19 @@ func assertNodeAtPath(t *testing.T, ds dag.DAGService, root *dag.Node, path stri
 		cur = nxt
 	}
 
-	curk, err := cur.Key()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if curk != exp {
+	curc := cur.Cid()
+	if !curc.Equals(exp) {
 		t.Fatal("node not as expected at end of path")
 	}
 }
 
 func TestInsertNode(t *testing.T) {
-	ds := mdtest.Mock()
-	root := new(dag.Node)
-	e := NewDagEditor(ds, root)
+	root := new(dag.ProtoNode)
+	e := NewDagEditor(root, nil)
 
 	testInsert(t, e, "a", "anodefortesting", false, "")
 	testInsert(t, e, "a/b", "data", false, "")
-	testInsert(t, e, "a/b/c/d/e", "blah", false, "merkledag: not found")
+	testInsert(t, e, "a/b/c/d/e", "blah", false, "no link by that name")
 	testInsert(t, e, "a/b/c/d/e", "foo", true, "")
 	testInsert(t, e, "a/b/c/d/f", "baz", true, "")
 	testInsert(t, e, "a/b/c/d/f", "bar", true, "")
@@ -80,27 +69,24 @@ func TestInsertNode(t *testing.T) {
 	testInsert(t, e, "", "bar", true, "cannot create link with no name!")
 	testInsert(t, e, "////", "slashes", true, "cannot create link with no name!")
 
-	k, err := e.GetNode().Key()
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := e.GetNode().Cid()
 
-	if k.B58String() != "QmThorWojP6YzLJwDukxiYCoKQSwyrMCvdt4WZ6rPm221t" {
-		t.Fatal("output was different than expected")
+	if c.String() != "QmZ8yeT9uD6ouJPNAYt62XffYuXBT6b4mP4obRSE9cJrSt" {
+		t.Fatal("output was different than expected: ", c)
 	}
 }
 
 func testInsert(t *testing.T, e *Editor, path, data string, create bool, experr string) {
-	child := &dag.Node{Data: []byte(data)}
-	ck, err := e.ds.Add(child)
+	child := dag.NodeWithData([]byte(data))
+	ck, err := e.tmp.Add(child)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	var c func() *dag.Node
+	var c func() *dag.ProtoNode
 	if create {
-		c = func() *dag.Node {
-			return &dag.Node{}
+		c = func() *dag.ProtoNode {
+			return &dag.ProtoNode{}
 		}
 	}
 
@@ -117,8 +103,8 @@ func testInsert(t *testing.T, e *Editor, path, data string, create bool, experr 
 	}
 
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal(err, path, data, create, experr)
 	}
 
-	assertNodeAtPath(t, e.ds, e.root, path, ck)
+	assertNodeAtPath(t, e.tmp, e.root, path, ck)
 }

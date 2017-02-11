@@ -1,13 +1,13 @@
 package dagutils
 
 import (
-	"bytes"
 	"fmt"
 	"path"
 
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
-	key "github.com/ipfs/go-ipfs/blocks/key"
 	dag "github.com/ipfs/go-ipfs/merkledag"
+
+	context "context"
+	cid "gx/ipfs/QmcTcsTvfaeEBRFo1TkFgT8sRmgi1n1LTZpecfVP8fzpGD/go-cid"
 )
 
 const (
@@ -19,25 +19,25 @@ const (
 type Change struct {
 	Type   int
 	Path   string
-	Before key.Key
-	After  key.Key
+	Before *cid.Cid
+	After  *cid.Cid
 }
 
 func (c *Change) String() string {
 	switch c.Type {
 	case Add:
-		return fmt.Sprintf("Added %s at %s", c.After.B58String()[:6], c.Path)
+		return fmt.Sprintf("Added %s at %s", c.After.String(), c.Path)
 	case Remove:
-		return fmt.Sprintf("Removed %s from %s", c.Before.B58String()[:6], c.Path)
+		return fmt.Sprintf("Removed %s from %s", c.Before.String(), c.Path)
 	case Mod:
-		return fmt.Sprintf("Changed %s to %s at %s", c.Before.B58String()[:6], c.After.B58String()[:6], c.Path)
+		return fmt.Sprintf("Changed %s to %s at %s", c.Before.String(), c.After.String(), c.Path)
 	default:
 		panic("nope")
 	}
 }
 
-func ApplyChange(ctx context.Context, ds dag.DAGService, nd *dag.Node, cs []*Change) (*dag.Node, error) {
-	e := NewDagEditor(ds, nd)
+func ApplyChange(ctx context.Context, ds dag.DAGService, nd *dag.ProtoNode, cs []*Change) (*dag.ProtoNode, error) {
+	e := NewDagEditor(nd, ds)
 	for _, c := range cs {
 		switch c.Type {
 		case Add:
@@ -45,7 +45,13 @@ func ApplyChange(ctx context.Context, ds dag.DAGService, nd *dag.Node, cs []*Cha
 			if err != nil {
 				return nil, err
 			}
-			err = e.InsertNodeAtPath(ctx, c.Path, child, nil)
+
+			childpb, ok := child.(*dag.ProtoNode)
+			if !ok {
+				return nil, dag.ErrNotProtobuf
+			}
+
+			err = e.InsertNodeAtPath(ctx, c.Path, childpb, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -65,42 +71,68 @@ func ApplyChange(ctx context.Context, ds dag.DAGService, nd *dag.Node, cs []*Cha
 			if err != nil {
 				return nil, err
 			}
-			err = e.InsertNodeAtPath(ctx, c.Path, child, nil)
+
+			childpb, ok := child.(*dag.ProtoNode)
+			if !ok {
+				return nil, dag.ErrNotProtobuf
+			}
+
+			err = e.InsertNodeAtPath(ctx, c.Path, childpb, nil)
 			if err != nil {
 				return nil, err
 			}
 		}
 	}
-	return e.GetNode(), nil
+
+	return e.Finalize(ds)
 }
 
-func Diff(ctx context.Context, ds dag.DAGService, a, b *dag.Node) []*Change {
-	if len(a.Links) == 0 && len(b.Links) == 0 {
-		ak, _ := a.Key()
-		bk, _ := b.Key()
+func Diff(ctx context.Context, ds dag.DAGService, a, b *dag.ProtoNode) ([]*Change, error) {
+	if len(a.Links()) == 0 && len(b.Links()) == 0 {
 		return []*Change{
 			&Change{
 				Type:   Mod,
-				Before: ak,
-				After:  bk,
+				Before: a.Cid(),
+				After:  b.Cid(),
 			},
-		}
+		}, nil
 	}
 
 	var out []*Change
-	clean_a := a.Copy()
-	clean_b := b.Copy()
+	clean_a := a.Copy().(*dag.ProtoNode)
+	clean_b := b.Copy().(*dag.ProtoNode)
 
 	// strip out unchanged stuff
-	for _, lnk := range a.Links {
+	for _, lnk := range a.Links() {
 		l, err := b.GetNodeLink(lnk.Name)
 		if err == nil {
-			if bytes.Equal(l.Hash, lnk.Hash) {
+			if l.Cid.Equals(lnk.Cid) {
 				// no change... ignore it
 			} else {
-				anode, _ := lnk.GetNode(ctx, ds)
-				bnode, _ := l.GetNode(ctx, ds)
-				sub := Diff(ctx, ds, anode, bnode)
+				anode, err := lnk.GetNode(ctx, ds)
+				if err != nil {
+					return nil, err
+				}
+
+				bnode, err := l.GetNode(ctx, ds)
+				if err != nil {
+					return nil, err
+				}
+
+				anodepb, ok := anode.(*dag.ProtoNode)
+				if !ok {
+					return nil, dag.ErrNotProtobuf
+				}
+
+				bnodepb, ok := bnode.(*dag.ProtoNode)
+				if !ok {
+					return nil, dag.ErrNotProtobuf
+				}
+
+				sub, err := Diff(ctx, ds, anodepb, bnodepb)
+				if err != nil {
+					return nil, err
+				}
 
 				for _, subc := range sub {
 					subc.Path = path.Join(lnk.Name, subc.Path)
@@ -112,22 +144,22 @@ func Diff(ctx context.Context, ds dag.DAGService, a, b *dag.Node) []*Change {
 		}
 	}
 
-	for _, lnk := range clean_a.Links {
+	for _, lnk := range clean_a.Links() {
 		out = append(out, &Change{
 			Type:   Remove,
 			Path:   lnk.Name,
-			Before: key.Key(lnk.Hash),
+			Before: lnk.Cid,
 		})
 	}
-	for _, lnk := range clean_b.Links {
+	for _, lnk := range clean_b.Links() {
 		out = append(out, &Change{
 			Type:  Add,
 			Path:  lnk.Name,
-			After: key.Key(lnk.Hash),
+			After: lnk.Cid,
 		})
 	}
 
-	return out
+	return out, nil
 }
 
 type Conflict struct {

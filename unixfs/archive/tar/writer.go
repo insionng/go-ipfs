@@ -6,8 +6,8 @@ import (
 	"path"
 	"time"
 
-	proto "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/gogo/protobuf/proto"
-	cxt "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
+	cxt "context"
+	proto "gx/ipfs/QmZ4Qi3GaRbjcx28Sme5eMH7RQjGkt8wHxt2a65oLaeFEV/gogo-protobuf/proto"
 
 	mdag "github.com/ipfs/go-ipfs/merkledag"
 	ft "github.com/ipfs/go-ipfs/unixfs"
@@ -34,19 +34,24 @@ func NewWriter(ctx cxt.Context, dag mdag.DAGService, archive bool, compression i
 	}, nil
 }
 
-func (w *Writer) writeDir(nd *mdag.Node, fpath string) error {
+func (w *Writer) writeDir(nd *mdag.ProtoNode, fpath string) error {
 	if err := writeDirHeader(w.TarW, fpath); err != nil {
 		return err
 	}
 
-	for i, ng := range w.Dag.GetDAG(w.ctx, nd) {
+	for i, ng := range mdag.GetDAG(w.ctx, w.Dag, nd) {
 		child, err := ng.Get(w.ctx)
 		if err != nil {
 			return err
 		}
 
-		npath := path.Join(fpath, nd.Links[i].Name)
-		if err := w.WriteNode(child, npath); err != nil {
+		childpb, ok := child.(*mdag.ProtoNode)
+		if !ok {
+			return mdag.ErrNotProtobuf
+		}
+
+		npath := path.Join(fpath, nd.Links()[i].Name)
+		if err := w.WriteNode(childpb, npath); err != nil {
 			return err
 		}
 	}
@@ -54,19 +59,22 @@ func (w *Writer) writeDir(nd *mdag.Node, fpath string) error {
 	return nil
 }
 
-func (w *Writer) writeFile(nd *mdag.Node, pb *upb.Data, fpath string) error {
+func (w *Writer) writeFile(nd *mdag.ProtoNode, pb *upb.Data, fpath string) error {
 	if err := writeFileHeader(w.TarW, fpath, pb.GetFilesize()); err != nil {
 		return err
 	}
 
-	dagr := uio.NewDataFileReader(w.ctx, nd, pb, w.Dag)
-	_, err := dagr.WriteTo(w.TarW)
-	return err
+	dagr := uio.NewPBFileReader(w.ctx, nd, pb, w.Dag)
+	if _, err := dagr.WriteTo(w.TarW); err != nil {
+		return err
+	}
+	w.TarW.Flush()
+	return nil
 }
 
-func (w *Writer) WriteNode(nd *mdag.Node, fpath string) error {
+func (w *Writer) WriteNode(nd *mdag.ProtoNode, fpath string) error {
 	pb := new(upb.Data)
-	if err := proto.Unmarshal(nd.Data, pb); err != nil {
+	if err := proto.Unmarshal(nd.Data(), pb); err != nil {
 		return err
 	}
 

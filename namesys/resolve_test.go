@@ -1,21 +1,28 @@
 package namesys
 
 import (
+	"context"
+	"errors"
 	"testing"
+	"time"
 
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
-	key "github.com/ipfs/go-ipfs/blocks/key"
 	path "github.com/ipfs/go-ipfs/path"
 	mockrouting "github.com/ipfs/go-ipfs/routing/mock"
-	u "github.com/ipfs/go-ipfs/util"
-	testutil "github.com/ipfs/go-ipfs/util/testutil"
+	testutil "github.com/ipfs/go-ipfs/thirdparty/testutil"
+
+	ds "gx/ipfs/QmRWDav6mzWseLWeYfVd5fvUKiVe9xNH29YfMF438fG364/go-datastore"
+	dssync "gx/ipfs/QmRWDav6mzWseLWeYfVd5fvUKiVe9xNH29YfMF438fG364/go-datastore/sync"
+	peer "gx/ipfs/QmfMmLGoKzCHDN7cGgk64PJr4iipzidDRME8HABSJqvmhC/go-libp2p-peer"
 )
 
 func TestRoutingResolve(t *testing.T) {
-	d := mockrouting.NewServer().Client(testutil.RandIdentityOrFatal(t))
+	dstore := dssync.MutexWrap(ds.NewMapDatastore())
+	serv := mockrouting.NewServer()
+	id := testutil.RandIdentityOrFatal(t)
+	d := serv.ClientWithDatastore(context.Background(), id, dstore)
 
-	resolver := NewRoutingResolver(d)
-	publisher := NewRoutingPublisher(d)
+	resolver := NewRoutingResolver(d, 0)
+	publisher := NewRoutingPublisher(d, dstore)
 
 	privk, pubk, err := testutil.RandTestKeyPair(512)
 	if err != nil {
@@ -28,13 +35,12 @@ func TestRoutingResolve(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pubkb, err := pubk.Bytes()
+	pid, err := peer.IDFromPublicKey(pubk)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	pkhash := u.Hash(pubkb)
-	res, err := resolver.Resolve(context.Background(), key.Key(pkhash).Pretty())
+	res, err := resolver.Resolve(context.Background(), pid.Pretty())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,4 +48,91 @@ func TestRoutingResolve(t *testing.T) {
 	if res != h {
 		t.Fatal("Got back incorrect value.")
 	}
+}
+
+func TestPrexistingExpiredRecord(t *testing.T) {
+	dstore := dssync.MutexWrap(ds.NewMapDatastore())
+	d := mockrouting.NewServer().ClientWithDatastore(context.Background(), testutil.RandIdentityOrFatal(t), dstore)
+
+	resolver := NewRoutingResolver(d, 0)
+	publisher := NewRoutingPublisher(d, dstore)
+
+	privk, pubk, err := testutil.RandTestKeyPair(512)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := peer.IDFromPublicKey(pubk)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Make an expired record and put it in the datastore
+	h := path.FromString("/ipfs/QmZULkCELmmk5XNfCgTnCyFgAVxBRBXyDHGGMVoLFLiXEN")
+	eol := time.Now().Add(time.Hour * -1)
+	err = PutRecordToRouting(context.Background(), privk, h, 0, eol, d, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Now, with an old record in the system already, try and publish a new one
+	err = publisher.Publish(context.Background(), privk, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = verifyCanResolve(resolver, id.Pretty(), h)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPrexistingRecord(t *testing.T) {
+	dstore := dssync.MutexWrap(ds.NewMapDatastore())
+	d := mockrouting.NewServer().ClientWithDatastore(context.Background(), testutil.RandIdentityOrFatal(t), dstore)
+
+	resolver := NewRoutingResolver(d, 0)
+	publisher := NewRoutingPublisher(d, dstore)
+
+	privk, pubk, err := testutil.RandTestKeyPair(512)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := peer.IDFromPublicKey(pubk)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Make a good record and put it in the datastore
+	h := path.FromString("/ipfs/QmZULkCELmmk5XNfCgTnCyFgAVxBRBXyDHGGMVoLFLiXEN")
+	eol := time.Now().Add(time.Hour)
+	err = PutRecordToRouting(context.Background(), privk, h, 0, eol, d, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Now, with an old record in the system already, try and publish a new one
+	err = publisher.Publish(context.Background(), privk, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = verifyCanResolve(resolver, id.Pretty(), h)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func verifyCanResolve(r Resolver, name string, exp path.Path) error {
+	res, err := r.Resolve(context.Background(), name)
+	if err != nil {
+		return err
+	}
+
+	if res != exp {
+		return errors.New("got back wrong record!")
+	}
+
+	return nil
 }

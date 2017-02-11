@@ -6,16 +6,11 @@ import (
 	"fmt"
 	"io"
 
-	ci "github.com/ipfs/go-ipfs/p2p/crypto"
-	peer "github.com/ipfs/go-ipfs/p2p/peer"
+	peer "gx/ipfs/QmfMmLGoKzCHDN7cGgk64PJr4iipzidDRME8HABSJqvmhC/go-libp2p-peer"
+	ci "gx/ipfs/QmfWDLQjGjVe4fr5CoztYW2DYYjRysMJrFe1RCsXLPTf46/go-libp2p-crypto"
 )
 
 func Init(out io.Writer, nBitsForKeypair int) (*Config, error) {
-	ds, err := datastoreConfig()
-	if err != nil {
-		return nil, err
-	}
-
 	identity, err := identityConfig(out, nBitsForKeypair)
 	if err != nil {
 		return nil, err
@@ -26,7 +21,7 @@ func Init(out io.Writer, nBitsForKeypair int) (*Config, error) {
 		return nil, err
 	}
 
-	snr, err := initSNRConfig()
+	datastore, err := datastoreConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -34,7 +29,7 @@ func Init(out io.Writer, nBitsForKeypair int) (*Config, error) {
 	conf := &Config{
 
 		// setup the node's default addresses.
-		// Note: two swarm listen addrs, one tcp, one utp.
+		// NOTE: two swarm listen addrs, one tcp, one utp.
 		Addresses: Addresses{
 			Swarm: []string{
 				"/ip4/0.0.0.0/tcp/4001",
@@ -45,18 +40,13 @@ func Init(out io.Writer, nBitsForKeypair int) (*Config, error) {
 			Gateway: "/ip4/127.0.0.1/tcp/8080",
 		},
 
-		Bootstrap:        BootstrapPeerStrings(bootstrapPeers),
-		SupernodeRouting: *snr,
-		Datastore:        *ds,
-		Identity:         identity,
+		Datastore: datastore,
+		Bootstrap: BootstrapPeerStrings(bootstrapPeers),
+		Identity:  identity,
 		Discovery: Discovery{MDNS{
 			Enabled:  true,
 			Interval: 10,
 		}},
-		Log: Log{
-			MaxSizeMB:  250,
-			MaxBackups: 1,
-		},
 
 		// setup the node mount points.
 		Mounts: Mounts{
@@ -64,27 +54,41 @@ func Init(out io.Writer, nBitsForKeypair int) (*Config, error) {
 			IPNS: "/ipns",
 		},
 
-		// tracking ipfs version used to generate the init folder and adding
-		// update checker default setting.
-		Version: VersionDefaultValue(),
+		Ipns: Ipns{
+			ResolveCacheSize: 128,
+		},
 
 		Gateway: Gateway{
 			RootRedirect: "",
 			Writable:     false,
+			PathPrefixes: []string{},
+			HTTPHeaders: map[string][]string{
+				"Access-Control-Allow-Origin":  []string{"*"},
+				"Access-Control-Allow-Methods": []string{"GET"},
+				"Access-Control-Allow-Headers": []string{"X-Requested-With"},
+			},
+		},
+		Reprovider: Reprovider{
+			Interval: "12h",
 		},
 	}
 
 	return conf, nil
 }
 
-func datastoreConfig() (*Datastore, error) {
+func datastoreConfig() (Datastore, error) {
 	dspath, err := DataStorePath("")
 	if err != nil {
-		return nil, err
+		return Datastore{}, err
 	}
-	return &Datastore{
-		Path: dspath,
-		Type: "leveldb",
+	return Datastore{
+		Path:               dspath,
+		Type:               "leveldb",
+		StorageMax:         "10GB",
+		StorageGCWatermark: 90, // 90%
+		GCPeriod:           "1h",
+		HashOnRead:         false,
+		BloomFilterSize:    0,
 	}, nil
 }
 

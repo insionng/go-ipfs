@@ -8,66 +8,39 @@ test_description="Test daemon command"
 
 . lib/test-lib.sh
 
-# TODO: randomize ports here once we add --config to ipfs daemon
 
-# this needs to be in a different test than "ipfs daemon --init" below
-test_expect_success "setup IPFS_PATH" '
-  IPFS_PATH="$(pwd)/.ipfs" &&
-  export IPFS_PATH
-'
+test_init_ipfs
+test_launch_ipfs_daemon
 
-# NOTE: this should remove bootstrap peers (needs a flag)
-# TODO(cryptix):
-#  - we won't see daemon startup failure because we put the daemon in the background - fix: fork with exit code after api listen
-#  - also default ports: might clash with local clients. Failure in that case isn't clear as well because pollEndpoint just uses the already running node
-test_expect_success "ipfs daemon --init launches" '
-  ipfs daemon --init >actual_daemon 2>daemon_err &
-'
-
-# this is like "'ipfs daemon' is ready" in test_launch_ipfs_daemon(), see test-lib.sh
-test_expect_success "initialization ended" '
-  IPFS_PID=$! &&
-  pollEndpoint -ep=/version -v -tout=1s -tries=60 2>poll_apierr > poll_apiout ||
-  test_fsh cat actual_daemon || test_fsh cat daemon_err || test_fsh cat poll_apierr || test_fsh cat poll_apiout
-'
-
-# this errors if daemon didnt --init $IPFS_PATH correctly
+# this errors if we didn't --init $IPFS_PATH correctly
 test_expect_success "'ipfs config Identity.PeerID' works" '
-  ipfs config Identity.PeerID >config_peerId
+  PEERID=$(ipfs config Identity.PeerID)
 '
 
 test_expect_success "'ipfs swarm addrs local' works" '
   ipfs swarm addrs local >local_addrs
 '
 
-
-# this is lifted straight from t0020-init.sh
 test_expect_success "ipfs peer id looks good" '
-  PEERID=$(cat config_peerId) &&
-  echo $PEERID | tr -dC "[:alnum:]" | wc -c | tr -d " " >actual_id &&
-  echo "46" >expected_id &&
-  test_cmp_repeat_10_sec expected_id actual_id
+  test_check_peerid "$PEERID"
 '
 
-# This is like t0020-init.sh "ipfs init output looks good"
-#
-# Unfortunately the line:
-#
-#   API server listening on /ip4/127.0.0.1/tcp/5001
-#
-# sometimes doesn't show up, so we cannot use test_expect_success yet.
-#
+# this is for checking SetAllowedOrigins race condition for the api and gateway
+# See https://github.com/ipfs/go-ipfs/pull/1966
+test_expect_success "ipfs API works with the correct allowed origin port" '
+  curl -s -X GET -H "Origin:http://localhost:$API_PORT" -I "http://$API_ADDR/api/v0/version"
+'
+
+test_expect_success "ipfs gateway works with the correct allowed origin port" '
+  curl -s -X GET -H "Origin:http://localhost:$GWAY_PORT" -I "http://$GWAY_ADDR/api/v0/version"
+'
+
 test_expect_success "ipfs daemon output looks good" '
   STARTFILE="ipfs cat /ipfs/$HASH_WELCOME_DOCS/readme" &&
   echo "Initializing daemon..." >expected_daemon &&
-  echo "initializing ipfs node at $IPFS_PATH" >>expected_daemon &&
-  echo "generating 2048-bit RSA keypair...done" >>expected_daemon &&
-  echo "peer identity: $PEERID" >>expected_daemon &&
-  echo "to get started, enter:" >>expected_daemon &&
-  printf "\\n\\t$STARTFILE\\n\\n" >>expected_daemon &&
-  cat local_addrs | sed "s/^/Swarm listening on /" >>expected_daemon &&
-  echo "API server listening on /ip4/127.0.0.1/tcp/5001" >>expected_daemon &&
-  echo "Gateway (readonly) server listening on /ip4/127.0.0.1/tcp/8080" >>expected_daemon &&
+  sed "s/^/Swarm listening on /" local_addrs >>expected_daemon &&
+  echo "API server listening on '$API_MADDR'" >>expected_daemon &&
+  echo "Gateway (readonly) server listening on '$GWAY_MADDR'" >>expected_daemon &&
   echo "Daemon is ready" >>expected_daemon &&
   test_cmp expected_daemon actual_daemon
 '
@@ -87,7 +60,7 @@ test_expect_success "ipfs version succeeds" '
 '
 
 test_expect_success "ipfs version output looks good" '
-	cat version.txt | egrep "^ipfs version [0-9]+\.[0-9]+\.[0-9]" >/dev/null ||
+	egrep "^ipfs version [0-9]+\.[0-9]+\.[0-9]" version.txt >/dev/null ||
 	test_fsh cat version.txt
 '
 
@@ -96,18 +69,33 @@ test_expect_success "ipfs help succeeds" '
 '
 
 test_expect_success "ipfs help output looks good" '
-	cat help.txt | egrep -i "^Usage:" >/dev/null &&
-	cat help.txt | egrep "ipfs .* <command>" >/dev/null ||
+	egrep -i "^Usage" help.txt >/dev/null &&
+	egrep "ipfs .* <command>" help.txt >/dev/null ||
 	test_fsh cat help.txt
 '
 
-# check transport is encrypted
+# netcat (nc) is needed for the following test
+test_expect_success "nc is available" '
+	type nc >/dev/null
+'
 
+# check transport is encrypted
 test_expect_success "transport should be encrypted" '
-  nc -w 5 localhost 4001 >swarmnc &&
-  grep -q "AES-256,AES-128" swarmnc &&
-  test_must_fail grep -q "/ipfs/identify" swarmnc ||
+  nc -w 1 localhost $SWARM_PORT > swarmnc < ../t0060-data/mss-ls &&
+  grep -q "/secio" swarmnc &&
+  test_must_fail grep -q "/plaintext/1.0.0" swarmnc ||
 	test_fsh cat swarmnc
+'
+
+test_expect_success "output from streaming commands works" '
+	test_expect_code 28 curl -m 5 http://localhost:$API_PORT/api/v0/stats/bw\?poll=true > statsout
+'
+
+test_expect_success "output looks good" '
+	grep TotalIn statsout > /dev/null &&
+	grep TotalOut statsout > /dev/null &&
+	grep RateIn statsout > /dev/null &&
+	grep RateOut statsout >/dev/null
 '
 
 # end same as in t0010
@@ -121,10 +109,34 @@ test_expect_success "'ipfs daemon' can be killed" '
 '
 
 test_expect_success "'ipfs daemon' should be able to run with a pipe attached to stdin (issue #861)" '
-  yes | ipfs daemon --init >stdin_daemon_out 2>stdin_daemon_err &
-  pollEndpoint -ep=/version -v -tout=1s -tries=10 >stdin_poll_apiout 2>stdin_poll_apierr &&
-  test_kill_repeat_10_sec $! ||
+	yes | ipfs daemon >stdin_daemon_out 2>stdin_daemon_err &
+	DAEMON_PID=$!
+	test_wait_for_file 20 100ms "$IPFS_PATH/api" &&
+	test_set_address_vars stdin_daemon_out
+'
+
+test_expect_success "daemon with pipe eventually becomes live" '
+  pollEndpoint -host='$API_MADDR' -ep=/version -v -tout=1s -tries=10 >stdin_poll_apiout 2>stdin_poll_apierr &&
+  test_kill_repeat_10_sec $DAEMON_PID ||
   test_fsh cat stdin_daemon_out || test_fsh cat stdin_daemon_err || test_fsh cat stdin_poll_apiout || test_fsh cat stdin_poll_apierr
 '
+
+ulimit -S -n 512
+TEST_ULIMIT_PRESET=1
+test_launch_ipfs_daemon
+
+test_expect_success "daemon raised its fd limit" '
+	grep "raised file descriptor limit to 1024." actual_daemon > /dev/null
+'
+
+test_expect_success "daemon actually can handle 1024 file descriptors" '
+	hang-fds -hold=2s 1000 '$API_MADDR'
+'
+
+test_expect_success "daemon didnt throw any errors" '
+	test_expect_code 1 grep "too many open files" daemon_err
+'
+
+test_kill_ipfs_daemon
 
 test_done

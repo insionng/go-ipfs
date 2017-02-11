@@ -1,13 +1,15 @@
 package core
 
 import (
+	"context"
 	"errors"
 	"strings"
 
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
-
-	merkledag "github.com/ipfs/go-ipfs/merkledag"
+	namesys "github.com/ipfs/go-ipfs/namesys"
 	path "github.com/ipfs/go-ipfs/path"
+
+	node "gx/ipfs/QmRSU5EqqWVZSNdbU51yXmVoF1uNw3JgTNB6RaiL7DZM16/go-ipld-node"
+	cid "gx/ipfs/QmcTcsTvfaeEBRFo1TkFgT8sRmgi1n1LTZpecfVP8fzpGD/go-cid"
 )
 
 // ErrNoNamesys is an explicit error for when an IPFS node doesn't
@@ -17,14 +19,13 @@ var ErrNoNamesys = errors.New(
 
 // Resolve resolves the given path by parsing out protocol-specific
 // entries (e.g. /ipns/<node-key>) and then going through the /ipfs/
-// entries and returning the final merkledage node.  Effectively
-// enables /ipns/, /dns/, etc. in commands.
-func Resolve(ctx context.Context, n *IpfsNode, p path.Path) (*merkledag.Node, error) {
+// entries and returning the final node.
+func Resolve(ctx context.Context, nsys namesys.NameSystem, r *path.Resolver, p path.Path) (node.Node, error) {
 	if strings.HasPrefix(p.String(), "/ipns/") {
 		// resolve ipns paths
 
 		// TODO(cryptix): we sould be able to query the local cache for the path
-		if n.Namesys == nil {
+		if nsys == nil {
 			return nil, ErrNoNamesys
 		}
 
@@ -40,7 +41,7 @@ func Resolve(ctx context.Context, n *IpfsNode, p path.Path) (*merkledag.Node, er
 			return nil, err
 		}
 
-		respath, err := n.Namesys.Resolve(ctx, resolvable.String())
+		respath, err := nsys.Resolve(ctx, resolvable.String())
 		if err != nil {
 			return nil, err
 		}
@@ -52,6 +53,40 @@ func Resolve(ctx context.Context, n *IpfsNode, p path.Path) (*merkledag.Node, er
 		}
 	}
 
-	// ok, we have an ipfs path now (or what we'll treat as one)
-	return n.Resolver.ResolvePath(ctx, p)
+	// ok, we have an IPFS path now (or what we'll treat as one)
+	return r.ResolvePath(ctx, p)
+}
+
+// ResolveToKey resolves a path to a key.
+//
+// It first checks if the path is already in the form of just a key (<key> or
+// /ipfs/<key>) and returns immediately if so. Otherwise, it falls back onto
+// Resolve to perform resolution of the dagnode being referenced.
+func ResolveToCid(ctx context.Context, n *IpfsNode, p path.Path) (*cid.Cid, error) {
+
+	// If the path is simply a key, parse and return it. Parsed paths are already
+	// normalized (read: prepended with /ipfs/ if needed), so segment[1] should
+	// always be the key.
+	if p.IsJustAKey() {
+		return cid.Decode(p.Segments()[1])
+	}
+
+	// Fall back onto regular dagnode resolution. Retrieve the second-to-last
+	// segment of the path and resolve its link to the last segment.
+	head, tail, err := p.PopLastSegment()
+	if err != nil {
+		return nil, err
+	}
+	dagnode, err := Resolve(ctx, n.Namesys, n.Resolver, head)
+	if err != nil {
+		return nil, err
+	}
+
+	// Extract and return the key of the link to the target dag node.
+	link, _, err := dagnode.ResolveLink([]string{tail})
+	if err != nil {
+		return nil, err
+	}
+
+	return link.Cid, nil
 }

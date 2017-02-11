@@ -22,7 +22,8 @@ type DiagnosticConnection struct {
 var (
 	visD3   = "d3"
 	visDot  = "dot"
-	visFmts = []string{visD3, visDot}
+	visText = "text"
+	visFmts = []string{visD3, visDot, visText}
 )
 
 type DiagnosticPeer struct {
@@ -41,17 +42,19 @@ var DefaultDiagnosticTimeout = time.Second * 20
 
 var DiagCmd = &cmds.Command{
 	Helptext: cmds.HelpText{
-		Tagline: "Generates diagnostic reports",
+		Tagline: "Generate diagnostic reports.",
 	},
 
 	Subcommands: map[string]*cmds.Command{
-		"net": diagNetCmd,
+		"net":  diagNetCmd,
+		"sys":  sysDiagCmd,
+		"cmds": ActiveReqsCmd,
 	},
 }
 
 var diagNetCmd = &cmds.Command{
 	Helptext: cmds.HelpText{
-		Tagline: "Generates a network diagnostics report",
+		Tagline: "Generate a network diagnostics report.",
 		ShortDescription: `
 Sends out a message to each node in the network recursively
 requesting a listing of data about them including number of
@@ -60,16 +63,16 @@ connected peers and latencies between them.
 The given timeout will be decremented 2s at every network hop, 
 ensuring peers try to return their diagnostics before the initiator's 
 timeout. If the timeout is too small, some peers may not be reached.
-30s and 60s are reasonable timeout values, though network vary.
+30s and 60s are reasonable timeout values, though networks vary.
 The default timeout is 20 seconds.
 
 The 'vis' option may be used to change the output format.
-four formats are supported:
- * plain text - easy to read
+Three formats are supported:
+ * text - Easy to read. Default.
  * d3 - json ready to be fed into d3view
  * dot - graphviz format
 
-The d3 format will output a json object ready to be consumed by
+The 'd3' format will output a json object ready to be consumed by
 the chord network viewer, available at the following hash:
 
     /ipfs/QmbesKpGyQGd5jtJFUGEB1ByPjNFpukhnKZDnkfxUiKn38
@@ -79,13 +82,13 @@ open the following link:
 
 	http://gateway.ipfs.io/ipfs/QmbesKpGyQGd5jtJFUGEB1ByPjNFpukhnKZDnkfxUiKn38/chord#<your hash>
 
-The dot format can be fed into graphviz and other programs
+The 'dot' format can be fed into graphviz and other programs
 that consume the dot format to generate graphs of the network.
 `,
 	},
 
 	Options: []cmds.Option{
-		cmds.StringOption("vis", "output vis. one of: "+strings.Join(visFmts, ", ")),
+		cmds.StringOption("vis", "Output format. One of: "+strings.Join(visFmts, ", ")).Default(visText),
 	},
 
 	Run: func(req cmds.Request, res cmds.Response) {
@@ -139,13 +142,16 @@ that consume the dot format to generate graphs of the network.
 				return
 			}
 			res.SetOutput(io.Reader(buf))
-		default:
+		case visText:
 			output, err := stdDiagOutputMarshal(standardDiagOutput(info))
 			if err != nil {
 				res.SetError(err, cmds.ErrNormal)
 				return
 			}
 			res.SetOutput(output)
+		default:
+			res.SetError(err, cmds.ErrNormal)
+			return
 		}
 	},
 }

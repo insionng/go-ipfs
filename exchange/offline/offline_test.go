@@ -1,20 +1,23 @@
 package offline
 
 import (
+	"context"
 	"testing"
 
-	ds "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore"
-	ds_sync "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore/sync"
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
 	blocks "github.com/ipfs/go-ipfs/blocks"
 	"github.com/ipfs/go-ipfs/blocks/blockstore"
 	"github.com/ipfs/go-ipfs/blocks/blocksutil"
-	key "github.com/ipfs/go-ipfs/blocks/key"
+
+	ds "gx/ipfs/QmRWDav6mzWseLWeYfVd5fvUKiVe9xNH29YfMF438fG364/go-datastore"
+	ds_sync "gx/ipfs/QmRWDav6mzWseLWeYfVd5fvUKiVe9xNH29YfMF438fG364/go-datastore/sync"
+	u "gx/ipfs/Qmb912gdngC1UWwTkhuW8knyRbcWeu5kqkxBpveLmW8bSr/go-ipfs-util"
+	cid "gx/ipfs/QmcTcsTvfaeEBRFo1TkFgT8sRmgi1n1LTZpecfVP8fzpGD/go-cid"
 )
 
 func TestBlockReturnsErr(t *testing.T) {
 	off := Exchange(bstore())
-	_, err := off.GetBlock(context.Background(), key.Key("foo"))
+	c := cid.NewCidV0(u.Hash([]byte("foo")))
+	_, err := off.GetBlock(context.Background(), c)
 	if err != nil {
 		return // as desired
 	}
@@ -26,12 +29,12 @@ func TestHasBlockReturnsNil(t *testing.T) {
 	ex := Exchange(store)
 	block := blocks.NewBlock([]byte("data"))
 
-	err := ex.HasBlock(context.Background(), block)
+	err := ex.HasBlock(block)
 	if err != nil {
 		t.Fail()
 	}
 
-	if _, err := store.Get(block.Key()); err != nil {
+	if _, err := store.Get(block.Cid()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -44,16 +47,16 @@ func TestGetBlocks(t *testing.T) {
 	expected := g.Blocks(2)
 
 	for _, b := range expected {
-		if err := ex.HasBlock(context.Background(), b); err != nil {
+		if err := ex.HasBlock(b); err != nil {
 			t.Fail()
 		}
 	}
 
-	request := func() []key.Key {
-		var ks []key.Key
+	request := func() []*cid.Cid {
+		var ks []*cid.Cid
 
 		for _, b := range expected {
-			ks = append(ks, b.Key())
+			ks = append(ks, b.Cid())
 		}
 		return ks
 	}()

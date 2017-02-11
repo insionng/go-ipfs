@@ -1,25 +1,26 @@
 package commands
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
-
-	key "github.com/ipfs/go-ipfs/blocks/key"
 	cmds "github.com/ipfs/go-ipfs/commands"
 	core "github.com/ipfs/go-ipfs/core"
-	crypto "github.com/ipfs/go-ipfs/p2p/crypto"
 	path "github.com/ipfs/go-ipfs/path"
+
+	peer "gx/ipfs/QmfMmLGoKzCHDN7cGgk64PJr4iipzidDRME8HABSJqvmhC/go-libp2p-peer"
+	crypto "gx/ipfs/QmfWDLQjGjVe4fr5CoztYW2DYYjRysMJrFe1RCsXLPTf46/go-libp2p-crypto"
 )
 
 var errNotOnline = errors.New("This command must be run in online mode. Try running 'ipfs daemon' first.")
 
 var PublishCmd = &cmds.Command{
 	Helptext: cmds.HelpText{
-		Tagline: "Publish an object to IPNS",
+		Tagline: "Publish an object to IPNS.",
 		ShortDescription: `
 IPNS is a PKI namespace, where names are the hashes of public keys, and
 the private key enables publishing new (signed) values. In publish, the
@@ -46,11 +47,19 @@ Publish an <ipfs-path> to another public key (not implemented):
 	},
 
 	Arguments: []cmds.Argument{
-		cmds.StringArg("name", false, false, "The IPNS name to publish to. Defaults to your node's peerID"),
-		cmds.StringArg("ipfs-path", true, false, "IPFS path of the obejct to be published at <name>").EnableStdin(),
+		cmds.StringArg("ipfs-path", true, false, "ipfs path of the object to be published.").EnableStdin(),
+	},
+	Options: []cmds.Option{
+		cmds.BoolOption("resolve", "Resolve given path before publishing.").Default(true),
+		cmds.StringOption("lifetime", "t",
+			`Time duration that the record will be valid for. <<default>>
+    This accepts durations such as "300s", "1.5h" or "2h45m". Valid time units are
+    "ns", "us" (or "µs"), "ms", "s", "m", "h".`).Default("24h"),
+		cmds.StringOption("ttl", "Time duration this record should be cached for (caution: experimental)."),
+		cmds.StringOption("key", "k", "name of key to use").Default("self"),
 	},
 	Run: func(req cmds.Request, res cmds.Response) {
-		log.Debug("Begin Publish")
+		log.Debug("begin publish")
 		n, err := req.InvocContext().GetNode()
 		if err != nil {
 			res.SetError(err, cmds.ErrNormal)
@@ -65,32 +74,56 @@ Publish an <ipfs-path> to another public key (not implemented):
 			}
 		}
 
-		args := req.Arguments()
+		if n.Mounts.Ipns != nil && n.Mounts.Ipns.IsActive() {
+			res.SetError(errors.New("You cannot manually publish while IPNS is mounted."), cmds.ErrNormal)
+			return
+		}
+
+		pstr := req.Arguments()[0]
 
 		if n.Identity == "" {
 			res.SetError(errors.New("Identity not loaded!"), cmds.ErrNormal)
 			return
 		}
 
-		var name string
-		var pstr string
+		popts := new(publishOpts)
 
-		switch len(args) {
-		case 2:
-			name = args[0]
-			pstr = args[1]
-			if name != n.Identity.Pretty() {
-				res.SetError(errors.New("keychains not yet implemented"), cmds.ErrNormal)
-				return
-			}
-		case 1:
-			// name = n.Identity.Pretty()
-			pstr = args[0]
+		popts.verifyExists, _, _ = req.Option("resolve").Bool()
+
+		validtime, _, _ := req.Option("lifetime").String()
+		d, err := time.ParseDuration(validtime)
+		if err != nil {
+			res.SetError(fmt.Errorf("error parsing lifetime option: %s", err), cmds.ErrNormal)
+			return
 		}
 
-		// TODO n.Keychain.Get(name).PrivKey
-		// TODO(cryptix): is req.Context().Context a child of n.Context()?
-		output, err := publish(req.Context(), n, n.PrivateKey, path.Path(pstr))
+		popts.pubValidTime = d
+
+		ctx := req.Context()
+		if ttl, found, _ := req.Option("ttl").String(); found {
+			d, err := time.ParseDuration(ttl)
+			if err != nil {
+				res.SetError(err, cmds.ErrNormal)
+				return
+			}
+
+			ctx = context.WithValue(ctx, "ipns-publish-ttl", d)
+		}
+
+		kname, _, _ := req.Option("key").String()
+		k, err := n.GetKey(kname)
+		if err != nil {
+			res.SetError(err, cmds.ErrNormal)
+			return
+		}
+
+		pth, err := path.ParsePath(pstr)
+		if err != nil {
+			res.SetError(err, cmds.ErrNormal)
+			return
+		}
+
+		output, err := publish(ctx, n, k, pth, popts)
 		if err != nil {
 			res.SetError(err, cmds.ErrNormal)
 			return
@@ -107,25 +140,34 @@ Publish an <ipfs-path> to another public key (not implemented):
 	Type: IpnsEntry{},
 }
 
-func publish(ctx context.Context, n *core.IpfsNode, k crypto.PrivKey, ref path.Path) (*IpnsEntry, error) {
-	// First, verify the path exists
-	_, err := core.Resolve(ctx, n, ref)
+type publishOpts struct {
+	verifyExists bool
+	pubValidTime time.Duration
+}
+
+func publish(ctx context.Context, n *core.IpfsNode, k crypto.PrivKey, ref path.Path, opts *publishOpts) (*IpnsEntry, error) {
+
+	if opts.verifyExists {
+		// verify the path exists
+		_, err := core.Resolve(ctx, n.Namesys, n.Resolver, ref)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	eol := time.Now().Add(opts.pubValidTime)
+	err := n.Namesys.PublishWithEOL(ctx, k, ref, eol)
 	if err != nil {
 		return nil, err
 	}
 
-	err = n.Namesys.Publish(ctx, k, ref)
-	if err != nil {
-		return nil, err
-	}
-
-	hash, err := k.GetPublic().Hash()
+	pid, err := peer.IDFromPrivateKey(k)
 	if err != nil {
 		return nil, err
 	}
 
 	return &IpnsEntry{
-		Name:  key.Key(hash).String(),
+		Name:  pid.Pretty(),
 		Value: ref.String(),
 	}, nil
 }

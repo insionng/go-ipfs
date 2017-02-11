@@ -1,20 +1,19 @@
 package ipns
 
 import (
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
+	context "context"
 
 	"github.com/ipfs/go-ipfs/core"
-	mdag "github.com/ipfs/go-ipfs/merkledag"
 	nsys "github.com/ipfs/go-ipfs/namesys"
-	ci "github.com/ipfs/go-ipfs/p2p/crypto"
 	path "github.com/ipfs/go-ipfs/path"
 	ft "github.com/ipfs/go-ipfs/unixfs"
+	ci "gx/ipfs/QmfWDLQjGjVe4fr5CoztYW2DYYjRysMJrFe1RCsXLPTf46/go-libp2p-crypto"
 )
 
 // InitializeKeyspace sets the ipns record for the given key to
 // point to an empty directory.
 func InitializeKeyspace(n *core.IpfsNode, key ci.PrivKey) error {
-	emptyDir := &mdag.Node{Data: ft.FolderPBData()}
+	emptyDir := ft.EmptyDirNode()
 	nodek, err := n.DAG.Add(emptyDir)
 	if err != nil {
 		return err
@@ -33,8 +32,8 @@ func InitializeKeyspace(n *core.IpfsNode, key ci.PrivKey) error {
 		return err
 	}
 
-	pub := nsys.NewRoutingPublisher(n.Routing)
-	if err := pub.Publish(ctx, key, path.FromKey(nodek)); err != nil {
+	pub := nsys.NewRoutingPublisher(n.Routing, n.Repo.Datastore())
+	if err := pub.Publish(ctx, key, path.FromCid(nodek)); err != nil {
 		return err
 	}
 

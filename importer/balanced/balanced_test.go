@@ -9,31 +9,34 @@ import (
 	"os"
 	"testing"
 
-	"github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
 	chunk "github.com/ipfs/go-ipfs/importer/chunk"
 	h "github.com/ipfs/go-ipfs/importer/helpers"
 	dag "github.com/ipfs/go-ipfs/merkledag"
 	mdtest "github.com/ipfs/go-ipfs/merkledag/test"
 	pin "github.com/ipfs/go-ipfs/pin"
 	uio "github.com/ipfs/go-ipfs/unixfs/io"
-	u "github.com/ipfs/go-ipfs/util"
+
+	"context"
+	u "gx/ipfs/Qmb912gdngC1UWwTkhuW8knyRbcWeu5kqkxBpveLmW8bSr/go-ipfs-util"
 )
 
 // TODO: extract these tests and more as a generic layout test suite
 
-func buildTestDag(ds dag.DAGService, spl chunk.Splitter) (*dag.Node, error) {
-	// Start the splitter
-	blkch, errs := chunk.Chan(spl)
-
+func buildTestDag(ds dag.DAGService, spl chunk.Splitter) (*dag.ProtoNode, error) {
 	dbp := h.DagBuilderParams{
 		Dagserv:  ds,
 		Maxlinks: h.DefaultLinksPerBlock,
 	}
 
-	return BalancedLayout(dbp.New(blkch, errs))
+	nd, err := BalancedLayout(dbp.New(spl))
+	if err != nil {
+		return nil, err
+	}
+
+	return nd.(*dag.ProtoNode), nil
 }
 
-func getTestDag(t *testing.T, ds dag.DAGService, size int64, blksize int64) (*dag.Node, []byte) {
+func getTestDag(t *testing.T, ds dag.DAGService, size int64, blksize int64) (*dag.ProtoNode, []byte) {
 	data := make([]byte, size)
 	u.NewTimeSeededRand().Read(data)
 	r := bytes.NewReader(data)
@@ -52,13 +55,11 @@ func TestSizeBasedSplit(t *testing.T) {
 		t.SkipNow()
 	}
 
-	bs := chunk.SizeSplitterGen(512)
-	testFileConsistency(t, bs, 32*512)
-	bs = chunk.SizeSplitterGen(4096)
-	testFileConsistency(t, bs, 32*4096)
+	testFileConsistency(t, 32*512, 512)
+	testFileConsistency(t, 32*4096, 4096)
 
 	// Uneven offset
-	testFileConsistency(t, bs, 31*4095)
+	testFileConsistency(t, 31*4095, 4096)
 }
 
 func dup(b []byte) []byte {
@@ -67,51 +68,44 @@ func dup(b []byte) []byte {
 	return o
 }
 
-func testFileConsistency(t *testing.T, bs chunk.SplitterGen, nbytes int) {
-	should := make([]byte, nbytes)
-	u.NewTimeSeededRand().Read(should)
-
-	read := bytes.NewReader(should)
+func testFileConsistency(t *testing.T, nbytes int64, blksize int64) {
 	ds := mdtest.Mock()
-	nd, err := buildTestDag(ds, bs(read))
-	if err != nil {
-		t.Fatal(err)
-	}
+	nd, should := getTestDag(t, ds, nbytes, blksize)
 
 	r, err := uio.NewDagReader(context.Background(), nd, ds)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	out, err := ioutil.ReadAll(r)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = arrComp(out, should)
-	if err != nil {
-		t.Fatal(err)
-	}
+	dagrArrComp(t, r, should)
 }
 
 func TestBuilderConsistency(t *testing.T) {
-	dagserv := mdtest.Mock()
-	nd, should := getTestDag(t, dagserv, 100000, chunk.DefaultBlockSize)
+	testFileConsistency(t, 100000, chunk.DefaultBlockSize)
+}
 
-	r, err := uio.NewDagReader(context.Background(), nd, dagserv)
+func TestNoChunking(t *testing.T) {
+	ds := mdtest.Mock()
+
+	nd, should := getTestDag(t, ds, 1000, 2000)
+	r, err := uio.NewDagReader(context.Background(), nd, ds)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	out, err := ioutil.ReadAll(r)
+	dagrArrComp(t, r, should)
+}
+
+func TestTwoChunks(t *testing.T) {
+	ds := mdtest.Mock()
+
+	nd, should := getTestDag(t, ds, 2000, 1000)
+	r, err := uio.NewDagReader(context.Background(), nd, ds)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = arrComp(out, should)
-	if err != nil {
-		t.Fatal(err)
-	}
+	dagrArrComp(t, r, should)
 }
 
 func arrComp(a, b []byte) error {
@@ -126,9 +120,20 @@ func arrComp(a, b []byte) error {
 	return nil
 }
 
+func dagrArrComp(t *testing.T, r io.Reader, should []byte) {
+	out, err := ioutil.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := arrComp(out, should); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type dagservAndPinner struct {
 	ds dag.DAGService
-	mp pin.ManualPinner
+	mp pin.Pinner
 }
 
 func TestIndirectBlocks(t *testing.T) {
@@ -169,15 +174,7 @@ func TestSeekingBasic(t *testing.T) {
 		t.Fatal("Failed to seek to correct offset")
 	}
 
-	out, err := ioutil.ReadAll(rs)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = arrComp(out, should[start:])
-	if err != nil {
-		t.Fatal(err)
-	}
+	dagrArrComp(t, rs, should[start:])
 }
 
 func TestSeekToBegin(t *testing.T) {
@@ -205,15 +202,7 @@ func TestSeekToBegin(t *testing.T) {
 		t.Fatal("Failed to seek to beginning")
 	}
 
-	out, err := ioutil.ReadAll(rs)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = arrComp(out, should)
-	if err != nil {
-		t.Fatal(err)
-	}
+	dagrArrComp(t, rs, should)
 }
 
 func TestSeekToAlmostBegin(t *testing.T) {
@@ -241,15 +230,7 @@ func TestSeekToAlmostBegin(t *testing.T) {
 		t.Fatal("Failed to seek to almost beginning")
 	}
 
-	out, err := ioutil.ReadAll(rs)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = arrComp(out, should[1:])
-	if err != nil {
-		t.Fatal(err)
-	}
+	dagrArrComp(t, rs, should[1:])
 }
 
 func TestSeekEnd(t *testing.T) {

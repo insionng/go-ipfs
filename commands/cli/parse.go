@@ -1,17 +1,22 @@
 package cli
 
 import (
-	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 
 	cmds "github.com/ipfs/go-ipfs/commands"
 	files "github.com/ipfs/go-ipfs/commands/files"
-	u "github.com/ipfs/go-ipfs/util"
+	logging "gx/ipfs/QmSpJByNKFX1sCsHBEp3R73FL4NF6FnQTEGyNAXHm2GS52/go-log"
+	u "gx/ipfs/Qmb912gdngC1UWwTkhuW8knyRbcWeu5kqkxBpveLmW8bSr/go-ipfs-util"
 )
+
+var log = logging.Logger("commands/cli")
 
 // Parse parses the input commandline string (cmd, flags, and args).
 // returns the corresponding command Request object.
@@ -31,25 +36,26 @@ func Parse(input []string, stdin *os.File, root *cmds.Command) (cmds.Request, *c
 		return nil, cmd, path, err
 	}
 
-	// if -r is provided, and it is associated with the package builtin
-	// recursive path option, allow recursive file paths
-	recursiveOpt := req.Option(cmds.RecShort)
-	recursive := false
-	if recursiveOpt != nil && recursiveOpt.Definition() == cmds.OptionRecursivePath {
-		recursive, _, err = recursiveOpt.Bool()
-		if err != nil {
-			return req, nil, nil, u.ErrCast()
+	// This is an ugly hack to maintain our current CLI interface while fixing
+	// other stdin usage bugs. Let this serve as a warning, be careful about the
+	// choices you make, they will haunt you forever.
+	if len(path) == 2 && path[0] == "bootstrap" {
+		if (path[1] == "add" && opts["default"] == true) ||
+			(path[1] == "rm" && opts["all"] == true) {
+			stdin = nil
 		}
 	}
 
-	stringArgs, fileArgs, err := parseArgs(stringVals, stdin, cmd.Arguments, recursive, root)
+	stringArgs, fileArgs, err := ParseArgs(req, stringVals, stdin, cmd.Arguments, root)
 	if err != nil {
 		return req, cmd, path, err
 	}
 	req.SetArguments(stringArgs)
 
-	file := files.NewSliceFile("", "", fileArgs)
-	req.SetFiles(file)
+	if len(fileArgs) > 0 {
+		file := files.NewSliceFile("", "", fileArgs)
+		req.SetFiles(file)
+	}
 
 	err = cmd.CheckArguments(req)
 	if err != nil {
@@ -57,6 +63,32 @@ func Parse(input []string, stdin *os.File, root *cmds.Command) (cmds.Request, *c
 	}
 
 	return req, cmd, path, nil
+}
+
+func ParseArgs(req cmds.Request, inputs []string, stdin *os.File, argDefs []cmds.Argument, root *cmds.Command) ([]string, []files.File, error) {
+	var err error
+
+	// if -r is provided, and it is associated with the package builtin
+	// recursive path option, allow recursive file paths
+	recursiveOpt := req.Option(cmds.RecShort)
+	recursive := false
+	if recursiveOpt != nil && recursiveOpt.Definition() == cmds.OptionRecursivePath {
+		recursive, _, err = recursiveOpt.Bool()
+		if err != nil {
+			return nil, nil, u.ErrCast()
+		}
+	}
+
+	// if '--hidden' is provided, enumerate hidden paths
+	hiddenOpt := req.Option("hidden")
+	hidden := false
+	if hiddenOpt != nil {
+		hidden, _, err = hiddenOpt.Bool()
+		if err != nil {
+			return nil, nil, u.ErrCast()
+		}
+	}
+	return parseArgs(inputs, stdin, argDefs, recursive, hidden, root)
 }
 
 // Parse a command line made up of sub-commands, short arguments, long arguments and positional arguments
@@ -85,13 +117,28 @@ func parseOpts(args []string, root *cmds.Command) (
 			err = fmt.Errorf("Unrecognized option '%s'", name)
 			return false, err
 		}
-
+		// mustUse implies that you must use the argument given after the '='
+		// eg. -r=true means you must take true into consideration
+		//		mustUse == true in the above case
+		// eg. ipfs -r <file> means disregard <file> since there is no '='
+		//		mustUse == false in the above situation
+		//arg == nil implies the flag was specified without an argument
 		if optDef.Type() == cmds.Bool {
-			if mustUse {
-				return false, fmt.Errorf("Option '%s' takes no arguments, but was passed '%s'", name, *arg)
+			if arg == nil || !mustUse {
+				opts[name] = true
+				return false, nil
 			}
-			opts[name] = ""
-			return false, nil
+			argVal := strings.ToLower(*arg)
+			switch argVal {
+			case "true":
+				opts[name] = true
+				return true, nil
+			case "false":
+				opts[name] = false
+				return true, nil
+			default:
+				return true, fmt.Errorf("Option '%s' takes true/false arguments, but was passed '%s'", name, argVal)
+			}
 		} else {
 			if arg == nil {
 				return true, fmt.Errorf("Missing argument for option '%s'", name)
@@ -169,7 +216,7 @@ func parseOpts(args []string, root *cmds.Command) (
 					}
 				}
 				var end bool
-				end, err = parseFlag(arg[0:1], rest, mustUse)
+				end, err = parseFlag(arg[:1], rest, mustUse)
 				if err != nil {
 					return
 				}
@@ -189,27 +236,32 @@ func parseOpts(args []string, root *cmds.Command) (
 				if err != nil {
 					return
 				}
+
+				// If we've come across an external binary call, pass all the remaining
+				// arguments on to it
+				if cmd.External {
+					stringVals = append(stringVals, args[i+1:]...)
+					return
+				}
 			} else {
 				stringVals = append(stringVals, arg)
+				if len(path) == 0 {
+					// found a typo or early argument
+					err = printSuggestions(stringVals, root)
+					return
+				}
 			}
 		}
 	}
 	return
 }
 
-func parseArgs(inputs []string, stdin *os.File, argDefs []cmds.Argument, recursive bool, root *cmds.Command) ([]string, []files.File, error) {
+const msgStdinInfo = "ipfs: Reading from %s; send Ctrl-d to stop."
+
+func parseArgs(inputs []string, stdin *os.File, argDefs []cmds.Argument, recursive, hidden bool, root *cmds.Command) ([]string, []files.File, error) {
 	// ignore stdin on Windows
 	if runtime.GOOS == "windows" {
 		stdin = nil
-	}
-
-	// check if stdin is coming from terminal or is being piped in
-	if stdin != nil {
-		if term, err := isTerminal(stdin); err != nil {
-			return nil, nil, err
-		} else if term {
-			stdin = nil // set to nil so we ignore it
-		}
 	}
 
 	// count required argument definitions
@@ -232,21 +284,15 @@ func parseArgs(inputs []string, stdin *os.File, argDefs []cmds.Argument, recursi
 	// and the last arg definition is not variadic (or there are no definitions), return an error
 	notVariadic := len(argDefs) == 0 || !argDefs[len(argDefs)-1].Variadic
 	if notVariadic && len(inputs) > len(argDefs) {
-		suggestions := suggestUnknownCmd(inputs, root)
-
-		if len(suggestions) > 1 {
-			return nil, nil, fmt.Errorf("Unknown Command \"%s\"\n\nDid you mean any of these?\n\n\t%s", inputs[0], strings.Join(suggestions, "\n\t"))
-		} else if len(suggestions) > 0 {
-			return nil, nil, fmt.Errorf("Unknown Command \"%s\"\n\nDid you mean this?\n\n\t%s", inputs[0], suggestions[0])
-		} else {
-			return nil, nil, fmt.Errorf("Unknown Command \"%s\"\n", inputs[0])
-		}
+		err := printSuggestions(inputs, root)
+		return nil, nil, err
 	}
 
 	stringArgs := make([]string, 0, numInputs)
-	fileArgs := make([]files.File, 0, numInputs)
 
+	fileArgs := make(map[string]files.File)
 	argDefIndex := 0 // the index of the current argument definition
+
 	for i := 0; i < numInputs; i++ {
 		argDef := getArgDef(argDefIndex, argDefs)
 
@@ -259,40 +305,50 @@ func parseArgs(inputs []string, stdin *os.File, argDefs []cmds.Argument, recursi
 			numRequired--
 		}
 
-		var err error
-		if argDef.Type == cmds.ArgString {
-			if stdin == nil || !argDef.SupportsStdin {
-				// add string values
-				stringArgs, inputs = appendString(stringArgs, inputs)
-
-			} else {
-				if len(inputs) > 0 {
-					// don't use stdin if we have inputs
+		fillingVariadic := argDefIndex+1 > len(argDefs)
+		switch argDef.Type {
+		case cmds.ArgString:
+			if len(inputs) > 0 {
+				stringArgs, inputs = append(stringArgs, inputs[0]), inputs[1:]
+			} else if stdin != nil && argDef.SupportsStdin && !fillingVariadic {
+				if r, err := maybeWrapStdin(stdin, msgStdinInfo); err == nil {
+					fileArgs[stdin.Name()] = files.NewReaderFile("stdin", "", r, nil)
 					stdin = nil
-				} else {
-					// if we have a stdin, read it in and use the data as a string value
-					stringArgs, stdin, err = appendStdinAsString(stringArgs, stdin)
+				}
+			}
+		case cmds.ArgFile:
+			if len(inputs) > 0 {
+				// treat stringArg values as file paths
+				fpath := inputs[0]
+				inputs = inputs[1:]
+				var file files.File
+				if fpath == "-" {
+					r, err := maybeWrapStdin(stdin, msgStdinInfo)
 					if err != nil {
 						return nil, nil, err
 					}
+
+					fpath = stdin.Name()
+					file = files.NewReaderFile("", fpath, r, nil)
+				} else {
+					nf, err := appendFile(fpath, argDef, recursive, hidden)
+					if err != nil {
+						return nil, nil, err
+					}
+
+					file = nf
 				}
-			}
-		} else if argDef.Type == cmds.ArgFile {
-			if stdin == nil || !argDef.SupportsStdin {
-				// treat stringArg values as file paths
-				fileArgs, inputs, err = appendFile(fileArgs, inputs, argDef, recursive)
+
+				fileArgs[fpath] = file
+			} else if stdin != nil && argDef.SupportsStdin &&
+				argDef.Required && !fillingVariadic {
+				r, err := maybeWrapStdin(stdin, msgStdinInfo)
 				if err != nil {
 					return nil, nil, err
 				}
 
-			} else {
-				if len(inputs) > 0 {
-					// don't use stdin if we have inputs
-					stdin = nil
-				} else {
-					// if we have a stdin, create a file from it
-					fileArgs, stdin = appendStdinAsFile(fileArgs, stdin)
-				}
+				fpath := stdin.Name()
+				fileArgs[fpath] = files.NewReaderFile("", fpath, r, nil)
 			}
 		}
 
@@ -308,7 +364,23 @@ func parseArgs(inputs []string, stdin *os.File, argDefs []cmds.Argument, recursi
 		}
 	}
 
-	return stringArgs, fileArgs, nil
+	return stringArgs, filesMapToSortedArr(fileArgs), nil
+}
+
+func filesMapToSortedArr(fs map[string]files.File) []files.File {
+	var names []string
+	for name, _ := range fs {
+		names = append(names, name)
+	}
+
+	sort.Strings(names)
+
+	var out []files.File
+	for _, f := range names {
+		out = append(out, fs[f])
+	}
+
+	return out
 }
 
 func getArgDef(i int, argDefs []cmds.Argument) *cmds.Argument {
@@ -325,71 +397,87 @@ func getArgDef(i int, argDefs []cmds.Argument) *cmds.Argument {
 	return nil
 }
 
-func appendString(args, inputs []string) ([]string, []string) {
-	return append(args, inputs[0]), inputs[1:]
-}
+const notRecursiveFmtStr = "'%s' is a directory, use the '-%s' flag to specify directories"
+const dirNotSupportedFmtStr = "Invalid path '%s', argument '%s' does not support directories"
 
-func appendStdinAsString(args []string, stdin *os.File) ([]string, *os.File, error) {
-	buf := new(bytes.Buffer)
-
-	_, err := buf.ReadFrom(stdin)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	input := strings.TrimSpace(buf.String())
-	return append(args, strings.Split(input, "\n")...), nil, nil
-}
-
-func appendFile(args []files.File, inputs []string, argDef *cmds.Argument, recursive bool) ([]files.File, []string, error) {
-	fpath := inputs[0]
-
+func appendFile(fpath string, argDef *cmds.Argument, recursive, hidden bool) (files.File, error) {
 	if fpath == "." {
 		cwd, err := os.Getwd()
 		if err != nil {
-			return nil, nil, err
+			return nil, err
+		}
+		cwd, err = filepath.EvalSymlinks(cwd)
+		if err != nil {
+			return nil, err
 		}
 		fpath = cwd
 	}
+
+	fpath = filepath.ToSlash(filepath.Clean(fpath))
+
 	stat, err := os.Lstat(fpath)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	if stat.IsDir() {
 		if !argDef.Recursive {
-			err = fmt.Errorf("Invalid path '%s', argument '%s' does not support directories",
-				fpath, argDef.Name)
-			return nil, nil, err
+			return nil, fmt.Errorf(dirNotSupportedFmtStr, fpath, argDef.Name)
 		}
 		if !recursive {
-			err = fmt.Errorf("'%s' is a directory, use the '-%s' flag to specify directories",
-				fpath, cmds.RecShort)
-			return nil, nil, err
+			return nil, fmt.Errorf(notRecursiveFmtStr, fpath, cmds.RecShort)
 		}
 	}
 
-	arg, err := files.NewSerialFile(path.Base(fpath), fpath, stat)
+	return files.NewSerialFile(path.Base(fpath), fpath, hidden, stat)
+}
+
+// Inform the user if a file is waiting on input
+func maybeWrapStdin(f *os.File, msg string) (io.ReadCloser, error) {
+	isTty, err := isTty(f)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return append(args, arg), inputs[1:], nil
+
+	if isTty {
+		return newMessageReader(f, fmt.Sprintf(msg, f.Name())), nil
+	}
+
+	return f, nil
 }
 
-func appendStdinAsFile(args []files.File, stdin *os.File) ([]files.File, *os.File) {
-	arg := files.NewReaderFile("", "", stdin, nil)
-	return append(args, arg), nil
-}
-
-// isTerminal returns true if stdin is a Stdin pipe (e.g. `cat file | ipfs`),
-// and false otherwise (e.g. nothing is being piped in, so stdin is
-// coming from the terminal)
-func isTerminal(stdin *os.File) (bool, error) {
-	stat, err := stdin.Stat()
+func isTty(f *os.File) (bool, error) {
+	fInfo, err := f.Stat()
 	if err != nil {
+		log.Error(err)
 		return false, err
 	}
 
-	// if stdin is a CharDevice, return true
-	return ((stat.Mode() & os.ModeCharDevice) != 0), nil
+	return (fInfo.Mode() & os.ModeCharDevice) != 0, nil
+}
+
+type messageReader struct {
+	r       io.ReadCloser
+	done    bool
+	message string
+}
+
+func newMessageReader(r io.ReadCloser, msg string) io.ReadCloser {
+	return &messageReader{
+		r:       r,
+		message: msg,
+	}
+}
+
+func (r *messageReader) Read(b []byte) (int, error) {
+	if !r.done {
+		fmt.Fprintln(os.Stderr, r.message)
+		r.done = true
+	}
+
+	return r.r.Read(b)
+}
+
+func (r *messageReader) Close() error {
+	return r.r.Close()
 }

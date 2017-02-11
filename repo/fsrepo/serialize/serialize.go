@@ -8,12 +8,13 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/facebookgo/atomicfile"
 	"github.com/ipfs/go-ipfs/repo/config"
-	"github.com/ipfs/go-ipfs/util"
+	logging "gx/ipfs/QmSpJByNKFX1sCsHBEp3R73FL4NF6FnQTEGyNAXHm2GS52/go-log"
+	"gx/ipfs/Qmb912gdngC1UWwTkhuW8knyRbcWeu5kqkxBpveLmW8bSr/go-ipfs-util"
+	"gx/ipfs/QmdYwCmx8pZRkzdcd8MhmLJqYVoVTC1aGsy5Q4reMGLNLg/atomicfile"
 )
 
-var log = util.Logger("fsrepo")
+var log = logging.Logger("fsrepo")
 
 // ReadConfigFile reads the config from `filename` into `cfg`.
 func ReadConfigFile(filename string, cfg interface{}) error {
@@ -64,13 +65,6 @@ func Load(filename string) (*config.Config, error) {
 
 	var cfg config.Config
 	err := ReadConfigFile(filename, &cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	// tilde expansion on datastore path
-	// TODO why is this here??
-	cfg.Datastore.Path, err = util.TildeExpansion(cfg.Datastore.Path)
 	if err != nil {
 		return nil, err
 	}

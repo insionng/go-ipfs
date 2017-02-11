@@ -4,14 +4,15 @@ package chunk
 import (
 	"io"
 
-	"github.com/ipfs/go-ipfs/util"
+	logging "gx/ipfs/QmSpJByNKFX1sCsHBEp3R73FL4NF6FnQTEGyNAXHm2GS52/go-log"
 )
 
-var log = util.Logger("chunk")
+var log = logging.Logger("chunk")
 
 var DefaultBlockSize int64 = 1024 * 256
 
 type Splitter interface {
+	Reader() io.Reader
 	NextBytes() ([]byte, error)
 }
 
@@ -76,4 +77,8 @@ func (ss *sizeSplitterv2) NextBytes() ([]byte, error) {
 	}
 
 	return buf[:n], nil
+}
+
+func (ss *sizeSplitterv2) Reader() io.Reader {
+	return ss.r
 }

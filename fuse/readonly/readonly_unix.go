@@ -1,4 +1,4 @@
-// +build linux darwin freebsd
+// +build linux darwin freebsd netbsd openbsd
 // +build !nofuse
 
 package readonly
@@ -9,22 +9,23 @@ import (
 	"os"
 	"syscall"
 
+	"context"
+	logging "gx/ipfs/QmSpJByNKFX1sCsHBEp3R73FL4NF6FnQTEGyNAXHm2GS52/go-log"
+	proto "gx/ipfs/QmZ4Qi3GaRbjcx28Sme5eMH7RQjGkt8wHxt2a65oLaeFEV/gogo-protobuf/proto"
+
 	fuse "github.com/ipfs/go-ipfs/Godeps/_workspace/src/bazil.org/fuse"
 	fs "github.com/ipfs/go-ipfs/Godeps/_workspace/src/bazil.org/fuse/fs"
-	proto "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/gogo/protobuf/proto"
-	"github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
 	core "github.com/ipfs/go-ipfs/core"
 	mdag "github.com/ipfs/go-ipfs/merkledag"
 	path "github.com/ipfs/go-ipfs/path"
-	eventlog "github.com/ipfs/go-ipfs/thirdparty/eventlog"
 	uio "github.com/ipfs/go-ipfs/unixfs/io"
 	ftpb "github.com/ipfs/go-ipfs/unixfs/pb"
-	lgbl "github.com/ipfs/go-ipfs/util/eventlog/loggables"
+	lgbl "gx/ipfs/QmTMy4hVSY28DdwJ9kBz6y7q6MuioFzPcpM3Ma3aPjo1i3/go-libp2p-loggables"
 )
 
-var log = eventlog.Logger("fuse/ipfs")
+var log = logging.Logger("fuse/ipfs")
 
-// FileSystem is the readonly Ipfs Fuse Filesystem.
+// FileSystem is the readonly IPFS Fuse Filesystem.
 type FileSystem struct {
 	Ipfs *core.IpfsNode
 }
@@ -46,7 +47,7 @@ type Root struct {
 
 // Attr returns file attributes.
 func (*Root) Attr(ctx context.Context, a *fuse.Attr) error {
-	*a = fuse.Attr{Mode: os.ModeDir | 0111} // -rw+x
+	a.Mode = os.ModeDir | 0111 // -rw+x
 	return nil
 }
 
@@ -65,31 +66,37 @@ func (s *Root) Lookup(ctx context.Context, name string) (fs.Node, error) {
 		return nil, fuse.ENOENT
 	}
 
-	return &Node{Ipfs: s.Ipfs, Nd: nd}, nil
+	pbnd, ok := nd.(*mdag.ProtoNode)
+	if !ok {
+		log.Error("fuse node was not a protobuf node")
+		return nil, fuse.ENOTSUP
+	}
+
+	return &Node{Ipfs: s.Ipfs, Nd: pbnd}, nil
 }
 
 // ReadDirAll reads a particular directory. Disallowed for root.
 func (*Root) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
-	log.Debug("Read Root.")
+	log.Debug("read Root")
 	return nil, fuse.EPERM
 }
 
 // Node is the core object representing a filesystem tree node.
 type Node struct {
 	Ipfs   *core.IpfsNode
-	Nd     *mdag.Node
+	Nd     *mdag.ProtoNode
 	fd     *uio.DagReader
 	cached *ftpb.Data
 }
 
 func (s *Node) loadData() error {
 	s.cached = new(ftpb.Data)
-	return proto.Unmarshal(s.Nd.Data, s.cached)
+	return proto.Unmarshal(s.Nd.Data(), s.cached)
 }
 
 // Attr returns the attributes of a given node.
 func (s *Node) Attr(ctx context.Context, a *fuse.Attr) error {
-	log.Debug("Node attr.")
+	log.Debug("Node attr")
 	if s.cached == nil {
 		if err := s.loadData(); err != nil {
 			return fmt.Errorf("readonly: loadData() failed: %s", err)
@@ -104,13 +111,13 @@ func (s *Node) Attr(ctx context.Context, a *fuse.Attr) error {
 		size := s.cached.GetFilesize()
 		a.Mode = 0444
 		a.Size = uint64(size)
-		a.Blocks = uint64(len(s.Nd.Links))
+		a.Blocks = uint64(len(s.Nd.Links()))
 		a.Uid = uint32(os.Getuid())
 		a.Gid = uint32(os.Getgid())
 	case ftpb.Data_Raw:
 		a.Mode = 0444
 		a.Size = uint64(len(s.cached.GetData()))
-		a.Blocks = uint64(len(s.Nd.Links))
+		a.Blocks = uint64(len(s.Nd.Links()))
 		a.Uid = uint32(os.Getuid())
 		a.Gid = uint32(os.Getgid())
 	case ftpb.Data_Symlink:
@@ -118,7 +125,6 @@ func (s *Node) Attr(ctx context.Context, a *fuse.Attr) error {
 		a.Size = uint64(len(s.cached.GetData()))
 		a.Uid = uint32(os.Getuid())
 		a.Gid = uint32(os.Getgid())
-
 	default:
 		return fmt.Errorf("Invalid data type - %s", s.cached.GetType())
 	}
@@ -134,17 +140,23 @@ func (s *Node) Lookup(ctx context.Context, name string) (fs.Node, error) {
 		return nil, fuse.ENOENT
 	}
 
-	return &Node{Ipfs: s.Ipfs, Nd: nodes[len(nodes)-1]}, nil
+	pbnd, ok := nodes[len(nodes)-1].(*mdag.ProtoNode)
+	if !ok {
+		log.Error("fuse lookup got non-protobuf node")
+		return nil, fuse.ENOTSUP
+	}
+
+	return &Node{Ipfs: s.Ipfs, Nd: pbnd}, nil
 }
 
 // ReadDirAll reads the link structure as directory entries
 func (s *Node) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	log.Debug("Node ReadDir")
-	entries := make([]fuse.Dirent, len(s.Nd.Links))
-	for i, link := range s.Nd.Links {
+	entries := make([]fuse.Dirent, len(s.Nd.Links()))
+	for i, link := range s.Nd.Links() {
 		n := link.Name
 		if len(n) == 0 {
-			n = link.Hash.B58String()
+			n = link.Cid.String()
 		}
 		entries[i] = fuse.Dirent{Name: n, Type: fuse.DT_File}
 	}
@@ -164,15 +176,12 @@ func (s *Node) Readlink(ctx context.Context, req *fuse.ReadlinkRequest) (string,
 
 func (s *Node) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
 
-	k, err := s.Nd.Key()
-	if err != nil {
-		return err
-	}
+	c := s.Nd.Cid()
 
 	// setup our logging event
 	lm := make(lgbl.DeferredMap)
 	lm["fs"] = "ipfs"
-	lm["key"] = func() interface{} { return k.Pretty() }
+	lm["key"] = func() interface{} { return c.String() }
 	lm["req_offset"] = req.Offset
 	lm["req_size"] = req.Size
 	defer log.EventBegin(ctx, "fuseRead", lm).Done()

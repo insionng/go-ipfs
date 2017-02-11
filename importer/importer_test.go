@@ -2,32 +2,34 @@ package importer
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"io/ioutil"
 	"testing"
 
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
 	chunk "github.com/ipfs/go-ipfs/importer/chunk"
 	dag "github.com/ipfs/go-ipfs/merkledag"
 	mdtest "github.com/ipfs/go-ipfs/merkledag/test"
 	uio "github.com/ipfs/go-ipfs/unixfs/io"
-	u "github.com/ipfs/go-ipfs/util"
+
+	node "gx/ipfs/QmRSU5EqqWVZSNdbU51yXmVoF1uNw3JgTNB6RaiL7DZM16/go-ipld-node"
+	u "gx/ipfs/Qmb912gdngC1UWwTkhuW8knyRbcWeu5kqkxBpveLmW8bSr/go-ipfs-util"
 )
 
-func getBalancedDag(t testing.TB, size int64, blksize int64) (*dag.Node, dag.DAGService) {
+func getBalancedDag(t testing.TB, size int64, blksize int64) (node.Node, dag.DAGService) {
 	ds := mdtest.Mock()
 	r := io.LimitReader(u.NewTimeSeededRand(), size)
-	nd, err := BuildDagFromReader(ds, chunk.NewSizeSplitter(r, blksize), nil)
+	nd, err := BuildDagFromReader(ds, chunk.NewSizeSplitter(r, blksize))
 	if err != nil {
 		t.Fatal(err)
 	}
 	return nd, ds
 }
 
-func getTrickleDag(t testing.TB, size int64, blksize int64) (*dag.Node, dag.DAGService) {
+func getTrickleDag(t testing.TB, size int64, blksize int64) (node.Node, dag.DAGService) {
 	ds := mdtest.Mock()
 	r := io.LimitReader(u.NewTimeSeededRand(), size)
-	nd, err := BuildTrickleDagFromReader(ds, chunk.NewSizeSplitter(r, blksize), nil)
+	nd, err := BuildTrickleDagFromReader(ds, chunk.NewSizeSplitter(r, blksize))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +42,7 @@ func TestBalancedDag(t *testing.T) {
 	u.NewTimeSeededRand().Read(buf)
 	r := bytes.NewReader(buf)
 
-	nd, err := BuildDagFromReader(ds, chunk.DefaultSplitter(r), nil)
+	nd, err := BuildDagFromReader(ds, chunk.DefaultSplitter(r))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +102,7 @@ func BenchmarkTrickleReadFull(b *testing.B) {
 	runReadBench(b, nd, ds)
 }
 
-func runReadBench(b *testing.B, nd *dag.Node, ds dag.DAGService) {
+func runReadBench(b *testing.B, nd node.Node, ds dag.DAGService) {
 	for i := 0; i < b.N; i++ {
 		ctx, cancel := context.WithCancel(context.Background())
 		read, err := uio.NewDagReader(ctx, nd, ds)

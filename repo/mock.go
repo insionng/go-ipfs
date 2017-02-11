@@ -3,16 +3,19 @@ package repo
 import (
 	"errors"
 
-	ds "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore"
+	keystore "github.com/ipfs/go-ipfs/keystore"
 	"github.com/ipfs/go-ipfs/repo/config"
+
+	ma "gx/ipfs/QmUAQaWbKxGCUTuoQVvvicbQNZ9APF5pDGWyAZSe93AtKH/go-multiaddr"
 )
 
-var errTODO = errors.New("TODO")
+var errTODO = errors.New("TODO: mock repo")
 
 // Mock is not thread-safe
 type Mock struct {
 	C config.Config
-	D ds.ThreadSafeDatastore
+	D Datastore
+	K keystore.Keystore
 }
 
 func (m *Mock) Config() (*config.Config, error) {
@@ -32,8 +35,12 @@ func (m *Mock) GetConfigKey(key string) (interface{}, error) {
 	return nil, errTODO
 }
 
-func (m *Mock) Datastore() ds.ThreadSafeDatastore { return m.D }
+func (m *Mock) Datastore() Datastore { return m.D }
+
+func (m *Mock) GetStorageUsage() (uint64, error) { return 0, nil }
 
 func (m *Mock) Close() error { return errTODO }
 
-func (m *Mock) SetAPIAddr(addr string) error { return errTODO }
+func (m *Mock) SetAPIAddr(addr ma.Multiaddr) error { return errTODO }
+
+func (m *Mock) Keystore() keystore.Keystore { return nil }

@@ -5,9 +5,9 @@ package ipns
 import (
 	"os"
 
+	"context"
 	"github.com/ipfs/go-ipfs/Godeps/_workspace/src/bazil.org/fuse"
 	"github.com/ipfs/go-ipfs/Godeps/_workspace/src/bazil.org/fuse/fs"
-	"github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
 )
 
 type Link struct {
@@ -16,9 +16,7 @@ type Link struct {
 
 func (l *Link) Attr(ctx context.Context, a *fuse.Attr) error {
 	log.Debug("Link attr.")
-	*a = fuse.Attr{
-		Mode: os.ModeSymlink | 0555,
-	}
+	a.Mode = os.ModeSymlink | 0555
 	return nil
 }
 

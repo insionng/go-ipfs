@@ -5,9 +5,14 @@
 *.swp
 .ipfsconfig
 *.out
+*.coverprofile
 *.test
 *.orig
 *~
 
-/test/bin
+coverage.txt
+
 .ipfs
+bin/gx
+bin/gx*
+bin/tmp

@@ -2,6 +2,7 @@ package corehttp
 
 import (
 	"html/template"
+	"net/url"
 	"path"
 	"strings"
 
@@ -24,8 +25,7 @@ type directoryItem struct {
 var listingTemplate *template.Template
 
 func init() {
-	assetPath := "../vendor/dir-index-html-v1.0.0/"
-	knownIconsBytes, err := assets.Asset(assetPath + "knownIcons.txt")
+	knownIconsBytes, err := assets.Asset("dir-index-html/knownIcons.txt")
 	if err != nil {
 		panic(err)
 	}
@@ -45,13 +45,20 @@ func init() {
 		return "ipfs-" + ext[1:] // slice of the first dot
 	}
 
+	// custom template-escaping function to escape a full path, including '#' and '?'
+	urlEscape := func(rawUrl string) string {
+		pathUrl := url.URL{Path: rawUrl}
+		return pathUrl.String()
+	}
+
 	// Directory listing template
-	dirIndexBytes, err := assets.Asset(assetPath + "dir-index.html")
+	dirIndexBytes, err := assets.Asset("dir-index-html/dir-index.html")
 	if err != nil {
 		panic(err)
 	}
 
 	listingTemplate = template.Must(template.New("dir").Funcs(template.FuncMap{
 		"iconFromExt": iconFromExt,
+		"urlEscape":   urlEscape,
 	}).Parse(string(dirIndexBytes)))
 }

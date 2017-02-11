@@ -9,12 +9,14 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"strings"
 
 	cmds "github.com/ipfs/go-ipfs/commands"
 	repo "github.com/ipfs/go-ipfs/repo"
 	config "github.com/ipfs/go-ipfs/repo/config"
 	fsrepo "github.com/ipfs/go-ipfs/repo/fsrepo"
-	u "github.com/ipfs/go-ipfs/util"
+
+	u "gx/ipfs/Qmb912gdngC1UWwTkhuW8knyRbcWeu5kqkxBpveLmW8bSr/go-ipfs-util"
 )
 
 type ConfigField struct {
@@ -24,46 +26,47 @@ type ConfigField struct {
 
 var ConfigCmd = &cmds.Command{
 	Helptext: cmds.HelpText{
-		Tagline: "get and set IPFS config values",
-		Synopsis: `
-ipfs config <key>          - Get value of <key>
-ipfs config <key> <value>  - Set value of <key> to <value>
-ipfs config show           - Show config file
-ipfs config edit           - Edit config file in $EDITOR
-ipfs config replace <file> - Replaces the config file with <file>
-`,
+		Tagline: "Get and set ipfs config values.",
 		ShortDescription: `
-ipfs config controls configuration variables. It works like 'git config'.
-The configuration values are stored in a config file inside your IPFS
+'ipfs config' controls configuration variables. It works like 'git config'.
+The configuration values are stored in a config file inside your ipfs
 repository.`,
 		LongDescription: `
-ipfs config controls configuration variables. It works
+'ipfs config' controls configuration variables. It works
 much like 'git config'. The configuration values are stored in a config
 file inside your IPFS repository.
 
-EXAMPLES:
+Examples:
 
-Get the value of the 'datastore.path' key:
+Get the value of the 'Datastore.Path' key:
 
-  ipfs config datastore.path
+  $ ipfs config Datastore.Path
 
-Set the value of the 'datastore.path' key:
+Set the value of the 'Datastore.Path' key:
 
-  ipfs config datastore.path ~/.ipfs/datastore
+  $ ipfs config Datastore.Path ~/.ipfs/datastore
 `,
 	},
 
 	Arguments: []cmds.Argument{
-		cmds.StringArg("key", true, false, "The key of the config entry (e.g. \"Addresses.API\")"),
-		cmds.StringArg("value", false, false, "The value to set the config entry to"),
+		cmds.StringArg("key", true, false, "The key of the config entry (e.g. \"Addresses.API\")."),
+		cmds.StringArg("value", false, false, "The value to set the config entry to."),
 	},
 	Options: []cmds.Option{
-		cmds.BoolOption("bool", "Set a boolean value"),
-		cmds.BoolOption("json", "Parse stringified JSON"),
+		cmds.BoolOption("bool", "Set a boolean value.").Default(false),
+		cmds.BoolOption("json", "Parse stringified JSON.").Default(false),
 	},
 	Run: func(req cmds.Request, res cmds.Response) {
 		args := req.Arguments()
 		key := args[0]
+
+		// This is a temporary fix until we move the private key out of the config file
+		switch strings.ToLower(key) {
+		case "identity", "identity.privkey":
+			res.SetError(fmt.Errorf("cannot show or change private key through API"), cmds.ErrNormal)
+			return
+		default:
+		}
 
 		r, err := fsrepo.Open(req.InvocContext().ConfigRoot)
 		if err != nil {
@@ -133,7 +136,7 @@ Set the value of the 'datastore.path' key:
 
 var configShowCmd = &cmds.Command{
 	Helptext: cmds.HelpText{
-		Tagline: "Outputs the content of the config file",
+		Tagline: "Output config file contents.",
 		ShortDescription: `
 WARNING: Your private key is stored in the config file, and it will be
 included in the output of this command.
@@ -141,24 +144,85 @@ included in the output of this command.
 	},
 
 	Run: func(req cmds.Request, res cmds.Response) {
-		filename, err := config.Filename(req.InvocContext().ConfigRoot)
+		fname, err := config.Filename(req.InvocContext().ConfigRoot)
 		if err != nil {
 			res.SetError(err, cmds.ErrNormal)
 			return
 		}
 
-		output, err := showConfig(filename)
+		data, err := ioutil.ReadFile(fname)
 		if err != nil {
 			res.SetError(err, cmds.ErrNormal)
 			return
 		}
-		res.SetOutput(output)
+
+		var cfg map[string]interface{}
+		err = json.Unmarshal(data, &cfg)
+		if err != nil {
+			res.SetError(err, cmds.ErrNormal)
+			return
+		}
+
+		err = scrubValue(cfg, []string{config.IdentityTag, config.PrivKeyTag})
+		if err != nil {
+			res.SetError(err, cmds.ErrNormal)
+			return
+		}
+
+		output, err := config.HumanOutput(cfg)
+		if err != nil {
+			res.SetError(err, cmds.ErrNormal)
+			return
+		}
+
+		res.SetOutput(bytes.NewReader(output))
 	},
+}
+
+func scrubValue(m map[string]interface{}, key []string) error {
+	find := func(m map[string]interface{}, k string) (string, interface{}, bool) {
+		lckey := strings.ToLower(k)
+		for mkey, val := range m {
+			lcmkey := strings.ToLower(mkey)
+			if lckey == lcmkey {
+				return mkey, val, true
+			}
+		}
+		return "", nil, false
+	}
+
+	cur := m
+	for _, k := range key[:len(key)-1] {
+		foundk, val, ok := find(cur, k)
+		if !ok {
+			return fmt.Errorf("failed to find specified key")
+		}
+
+		if foundk != k {
+			// case mismatch, calling this an error
+			return fmt.Errorf("case mismatch in config, expected %q but got %q", k, foundk)
+		}
+
+		mval, mok := val.(map[string]interface{})
+		if !mok {
+			return fmt.Errorf("%s was not a map", foundk)
+		}
+
+		cur = mval
+	}
+
+	todel, _, ok := find(cur, key[len(key)-1])
+	if !ok {
+		return fmt.Errorf("%s, not found", strings.Join(key, "."))
+	}
+
+	delete(cur, todel)
+	return nil
 }
 
 var configEditCmd = &cmds.Command{
 	Helptext: cmds.HelpText{
-		Tagline: "Opens the config file for editing in $EDITOR",
+		Tagline: "Open the config file for editing in $EDITOR.",
 		ShortDescription: `
 To use 'ipfs config edit', you must have the $EDITOR environment
 variable set to your preferred text editor.
@@ -181,15 +245,15 @@ variable set to your preferred text editor.
 
 var configReplaceCmd = &cmds.Command{
 	Helptext: cmds.HelpText{
-		Tagline: "Replaces the config with <file>",
+		Tagline: "Replace the config with <file>.",
 		ShortDescription: `
-Make sure to back up the config file first if neccessary, this operation
+Make sure to back up the config file first if neccessary, as this operation
 can't be undone.
 `,
 	},
 
 	Arguments: []cmds.Argument{
-		cmds.FileArg("file", true, false, "The file to use as the new config"),
+		cmds.FileArg("file", true, false, "The file to use as the new config."),
 	},
 	Run: func(req cmds.Request, res cmds.Response) {
 		r, err := fsrepo.Open(req.InvocContext().ConfigRoot)
@@ -217,7 +281,7 @@ can't be undone.
 func getConfig(r repo.Repo, key string) (*ConfigField, error) {
 	value, err := r.GetConfigKey(key)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to get config value: %s", err)
+		return nil, fmt.Errorf("Failed to get config value: %q", err)
 	}
 	return &ConfigField{
 		Key:   key,
@@ -228,20 +292,9 @@ func getConfig(r repo.Repo, key string) (*ConfigField, error) {
 func setConfig(r repo.Repo, key string, value interface{}) (*ConfigField, error) {
 	err := r.SetConfigKey(key, value)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to set config value: %s (maybe use --json?)", err)
+		return nil, fmt.Errorf("failed to set config value: %s (maybe use --json?)", err)
 	}
 	return getConfig(r, key)
-}
-
-func showConfig(filename string) (io.Reader, error) {
-	// TODO maybe we should omit privkey so we don't accidentally leak it?
-
-	data, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return nil, err
-	}
-
-	return bytes.NewReader(data), nil
 }
 
 func editConfig(filename string) error {
@@ -258,8 +311,23 @@ func editConfig(filename string) error {
 func replaceConfig(r repo.Repo, file io.Reader) error {
 	var cfg config.Config
 	if err := json.NewDecoder(file).Decode(&cfg); err != nil {
-		return errors.New("Failed to decode file as config")
+		return errors.New("failed to decode file as config")
 	}
+	if len(cfg.Identity.PrivKey) != 0 {
+		return errors.New("setting private key with API is not supported")
+	}
+
+	keyF, err := getConfig(r, config.PrivKeySelector)
+	if err != nil {
+		return fmt.Errorf("Failed to get PrivKey")
+	}
+
+	pkstr, ok := keyF.Value.(string)
+	if !ok {
+		return fmt.Errorf("private key in config was not a string")
+	}
+
+	cfg.Identity.PrivKey = pkstr
 
 	return r.SetConfig(&cfg)
 }

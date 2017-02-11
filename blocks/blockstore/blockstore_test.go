@@ -2,29 +2,39 @@ package blockstore
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"testing"
 
-	ds "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore"
-	dsq "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore/query"
-	ds_sync "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-datastore/sync"
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
-
 	blocks "github.com/ipfs/go-ipfs/blocks"
-	key "github.com/ipfs/go-ipfs/blocks/key"
-)
+	dshelp "github.com/ipfs/go-ipfs/thirdparty/ds-help"
 
-// TODO(brian): TestGetReturnsNil
+	ds "gx/ipfs/QmRWDav6mzWseLWeYfVd5fvUKiVe9xNH29YfMF438fG364/go-datastore"
+	dsq "gx/ipfs/QmRWDav6mzWseLWeYfVd5fvUKiVe9xNH29YfMF438fG364/go-datastore/query"
+	ds_sync "gx/ipfs/QmRWDav6mzWseLWeYfVd5fvUKiVe9xNH29YfMF438fG364/go-datastore/sync"
+	u "gx/ipfs/Qmb912gdngC1UWwTkhuW8knyRbcWeu5kqkxBpveLmW8bSr/go-ipfs-util"
+	cid "gx/ipfs/QmcTcsTvfaeEBRFo1TkFgT8sRmgi1n1LTZpecfVP8fzpGD/go-cid"
+)
 
 func TestGetWhenKeyNotPresent(t *testing.T) {
 	bs := NewBlockstore(ds_sync.MutexWrap(ds.NewMapDatastore()))
-	_, err := bs.Get(key.Key("not present"))
+	c := cid.NewCidV0(u.Hash([]byte("stuff")))
+	bl, err := bs.Get(c)
 
-	if err != nil {
-		t.Log("As expected, block is not present")
-		return
+	if bl != nil {
+		t.Error("nil block expected")
 	}
-	t.Fail()
+	if err == nil {
+		t.Error("error expected, got nil")
+	}
+}
+
+func TestGetWhenKeyIsNil(t *testing.T) {
+	bs := NewBlockstore(ds_sync.MutexWrap(ds.NewMapDatastore()))
+	_, err := bs.Get(nil)
+	if err != ErrNotFound {
+		t.Fail()
+	}
 }
 
 func TestPutThenGetBlock(t *testing.T) {
@@ -36,35 +46,62 @@ func TestPutThenGetBlock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	blockFromBlockstore, err := bs.Get(block.Key())
+	blockFromBlockstore, err := bs.Get(block.Cid())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(block.Data, blockFromBlockstore.Data) {
+	if !bytes.Equal(block.RawData(), blockFromBlockstore.RawData()) {
 		t.Fail()
 	}
 }
 
-func newBlockStoreWithKeys(t *testing.T, d ds.Datastore, N int) (Blockstore, []key.Key) {
+func TestHashOnRead(t *testing.T) {
+	orginalDebug := u.Debug
+	defer (func() {
+		u.Debug = orginalDebug
+	})()
+	u.Debug = false
+
+	bs := NewBlockstore(ds_sync.MutexWrap(ds.NewMapDatastore()))
+	bl := blocks.NewBlock([]byte("some data"))
+	blBad, err := blocks.NewBlockWithCid([]byte("some other data"), bl.Cid())
+	if err != nil {
+		t.Fatal("debug is off, still got an error")
+	}
+	bl2 := blocks.NewBlock([]byte("some other data"))
+	bs.Put(blBad)
+	bs.Put(bl2)
+	bs.HashOnRead(true)
+
+	if _, err := bs.Get(bl.Cid()); err != ErrHashMismatch {
+		t.Fatalf("expected '%v' got '%v'\n", ErrHashMismatch, err)
+	}
+
+	if b, err := bs.Get(bl2.Cid()); err != nil || b.String() != bl2.String() {
+		t.Fatal("got wrong blocks")
+	}
+}
+
+func newBlockStoreWithKeys(t *testing.T, d ds.Datastore, N int) (Blockstore, []*cid.Cid) {
 	if d == nil {
 		d = ds.NewMapDatastore()
 	}
 	bs := NewBlockstore(ds_sync.MutexWrap(d))
 
-	keys := make([]key.Key, N)
+	keys := make([]*cid.Cid, N)
 	for i := 0; i < N; i++ {
 		block := blocks.NewBlock([]byte(fmt.Sprintf("some data %d", i)))
 		err := bs.Put(block)
 		if err != nil {
 			t.Fatal(err)
 		}
-		keys[i] = block.Key()
+		keys[i] = block.Cid()
 	}
 	return bs, keys
 }
 
-func collect(ch <-chan key.Key) []key.Key {
-	var keys []key.Key
+func collect(ch <-chan *cid.Cid) []*cid.Cid {
+	var keys []*cid.Cid
 	for k := range ch {
 		keys = append(keys, k)
 	}
@@ -82,7 +119,7 @@ func TestAllKeysSimple(t *testing.T) {
 	keys2 := collect(ch)
 
 	// for _, k2 := range keys2 {
-	// 	t.Log("found ", k2.Pretty())
+	// 	t.Log("found ", k2.B58String())
 	// }
 
 	expectMatches(t, keys, keys2)
@@ -109,97 +146,42 @@ func TestAllKeysRespectsContext(t *testing.T) {
 		errors <- nil // a nil one to signal break
 	}
 
-	// Once without context, to make sure it all works
-	{
-		var results dsq.Results
-		var resultsmu = make(chan struct{})
-		resultChan := make(chan dsq.Result)
-		d.SetFunc(func(q dsq.Query) (dsq.Results, error) {
-			results = dsq.ResultsWithChan(q, resultChan)
-			resultsmu <- struct{}{}
-			return results, nil
-		})
+	var results dsq.Results
+	var resultsmu = make(chan struct{})
+	resultChan := make(chan dsq.Result)
+	d.SetFunc(func(q dsq.Query) (dsq.Results, error) {
+		results = dsq.ResultsWithChan(q, resultChan)
+		resultsmu <- struct{}{}
+		return results, nil
+	})
 
-		go getKeys(context.Background())
+	go getKeys(context.Background())
 
-		// make sure it's waiting.
-		<-started
-		<-resultsmu
-		select {
-		case <-done:
-			t.Fatal("sync is wrong")
-		case <-results.Process().Closing():
-			t.Fatal("should not be closing")
-		case <-results.Process().Closed():
-			t.Fatal("should not be closed")
-		default:
-		}
-
-		e := dsq.Entry{Key: BlockPrefix.ChildString("foo").String()}
-		resultChan <- dsq.Result{Entry: e} // let it go.
-		close(resultChan)
-		<-done                       // should be done now.
-		<-results.Process().Closed() // should be closed now
-
-		// print any errors
-		for err := range errors {
-			if err == nil {
-				break
-			}
-			t.Error(err)
-		}
+	// make sure it's waiting.
+	<-started
+	<-resultsmu
+	select {
+	case <-done:
+		t.Fatal("sync is wrong")
+	case <-results.Process().Closing():
+		t.Fatal("should not be closing")
+	case <-results.Process().Closed():
+		t.Fatal("should not be closed")
+	default:
 	}
 
-	// Once with
-	{
-		var results dsq.Results
-		var resultsmu = make(chan struct{})
-		resultChan := make(chan dsq.Result)
-		d.SetFunc(func(q dsq.Query) (dsq.Results, error) {
-			results = dsq.ResultsWithChan(q, resultChan)
-			resultsmu <- struct{}{}
-			return results, nil
-		})
+	e := dsq.Entry{Key: BlockPrefix.ChildString("foo").String()}
+	resultChan <- dsq.Result{Entry: e} // let it go.
+	close(resultChan)
+	<-done                       // should be done now.
+	<-results.Process().Closed() // should be closed now
 
-		ctx, cancel := context.WithCancel(context.Background())
-		go getKeys(ctx)
-
-		// make sure it's waiting.
-		<-started
-		<-resultsmu
-		select {
-		case <-done:
-			t.Fatal("sync is wrong")
-		case <-results.Process().Closing():
-			t.Fatal("should not be closing")
-		case <-results.Process().Closed():
-			t.Fatal("should not be closed")
-		default:
+	// print any errors
+	for err := range errors {
+		if err == nil {
+			break
 		}
-
-		cancel() // let it go.
-
-		select {
-		case <-done:
-			t.Fatal("sync is wrong")
-		case <-results.Process().Closed():
-			t.Fatal("should not be closed") // should not be closed yet.
-		case <-results.Process().Closing():
-			// should be closing now!
-			t.Log("closing correctly at this point.")
-		}
-
-		close(resultChan)
-		<-done                       // should be done now.
-		<-results.Process().Closed() // should be closed now
-
-		// print any errors
-		for err := range errors {
-			if err == nil {
-				break
-			}
-			t.Error(err)
-		}
+		t.Error(err)
 	}
 
 }
@@ -208,18 +190,18 @@ func TestValueTypeMismatch(t *testing.T) {
 	block := blocks.NewBlock([]byte("some data"))
 
 	datastore := ds.NewMapDatastore()
-	k := BlockPrefix.Child(block.Key().DsKey())
+	k := BlockPrefix.Child(dshelp.CidToDsKey(block.Cid()))
 	datastore.Put(k, "data that isn't a block!")
 
 	blockstore := NewBlockstore(ds_sync.MutexWrap(datastore))
 
-	_, err := blockstore.Get(block.Key())
+	_, err := blockstore.Get(block.Cid())
 	if err != ValueTypeMismatch {
 		t.Fatal(err)
 	}
 }
 
-func expectMatches(t *testing.T, expect, actual []key.Key) {
+func expectMatches(t *testing.T, expect, actual []*cid.Cid) {
 
 	if len(expect) != len(actual) {
 		t.Errorf("expect and actual differ: %d != %d", len(expect), len(actual))
@@ -227,7 +209,7 @@ func expectMatches(t *testing.T, expect, actual []key.Key) {
 	for _, ek := range expect {
 		found := false
 		for _, ak := range actual {
-			if ek == ak {
+			if ek.Equals(ak) {
 				found = true
 			}
 		}

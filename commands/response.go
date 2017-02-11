@@ -36,17 +36,19 @@ type EncodingType string
 
 // Supported EncodingType constants.
 const (
-	JSON = "json"
-	XML  = "xml"
-	Text = "text"
+	JSON     = "json"
+	XML      = "xml"
+	Protobuf = "protobuf"
+	Text     = "text"
 	// TODO: support more encoding types
 )
 
 func marshalJson(value interface{}) (io.Reader, error) {
-	b, err := json.MarshalIndent(value, "", "  ")
+	b, err := json.Marshal(value)
 	if err != nil {
 		return nil, err
 	}
+	b = append(b, '\n')
 	return bytes.NewReader(b), nil
 }
 

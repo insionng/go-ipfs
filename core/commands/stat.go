@@ -7,36 +7,77 @@ import (
 	"io"
 	"time"
 
-	humanize "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/dustin/go-humanize"
+	humanize "gx/ipfs/QmPSBJL4momYnE7DcUyk2DVhD6rH488ZmHBGLbxNdhU44K/go-humanize"
 
 	cmds "github.com/ipfs/go-ipfs/commands"
-	metrics "github.com/ipfs/go-ipfs/metrics"
-	peer "github.com/ipfs/go-ipfs/p2p/peer"
-	protocol "github.com/ipfs/go-ipfs/p2p/protocol"
-	u "github.com/ipfs/go-ipfs/util"
+	metrics "gx/ipfs/QmY2otvyPM2sTaDsczo7Yuosg98sUMCJ9qx1gpPaAPTS9B/go-libp2p-metrics"
+	protocol "gx/ipfs/QmZNkThpqfVXs9GNbexPrfBbXSLNYeKrE7jwFM2oqHbyqN/go-libp2p-protocol"
+	u "gx/ipfs/Qmb912gdngC1UWwTkhuW8knyRbcWeu5kqkxBpveLmW8bSr/go-ipfs-util"
+	peer "gx/ipfs/QmfMmLGoKzCHDN7cGgk64PJr4iipzidDRME8HABSJqvmhC/go-libp2p-peer"
 )
 
 var StatsCmd = &cmds.Command{
 	Helptext: cmds.HelpText{
-		Tagline:          "Query IPFS statistics",
-		ShortDescription: ``,
+		Tagline: "Query IPFS statistics.",
+		ShortDescription: `'ipfs stats' is a set of commands to help look at statistics
+for your IPFS node.
+`,
+		LongDescription: `'ipfs stats' is a set of commands to help look at statistics
+for your IPFS node.`,
 	},
 
 	Subcommands: map[string]*cmds.Command{
-		"bw": statBwCmd,
+		"bw":      statBwCmd,
+		"repo":    repoStatCmd,
+		"bitswap": bitswapStatCmd,
 	},
 }
 
 var statBwCmd = &cmds.Command{
 	Helptext: cmds.HelpText{
-		Tagline:          "Print ipfs bandwidth information",
-		ShortDescription: ``,
+		Tagline: "Print ipfs bandwidth information.",
+		ShortDescription: `'ipfs stats bw' prints bandwidth information for the ipfs daemon.
+It displays: TotalIn, TotalOut, RateIn, RateOut.
+		`,
+		LongDescription: `'ipfs stats bw' prints bandwidth information for the ipfs daemon.
+It displays: TotalIn, TotalOut, RateIn, RateOut.
+
+By default, overall bandwidth and all protocols are shown. To limit bandwidth
+to a particular peer, use the 'peer' option along with that peer's multihash
+id. To specify a specific protocol, use the 'proto' option. The 'peer' and
+'proto' options cannot be specified simultaneously. The protocols that are
+queried using this method are outlined in the specification:
+https://github.com/libp2p/specs/blob/master/7-properties.md#757-protocol-multicodecs
+
+Example protocol options:
+  - /ipfs/id/1.0.0
+  - /ipfs/bitswap
+  - /ipfs/dht
+
+Example:
+
+    > ipfs stats bw -t /ipfs/bitswap
+    Bandwidth
+    TotalIn: 5.0MB
+    TotalOut: 0B
+    RateIn: 343B/s
+    RateOut: 0B/s
+    > ipfs stats bw -p QmepgFW7BHEtU4pZJdxaNiv75mKLLRQnPi1KaaXmQN4V1a
+    Bandwidth
+    TotalIn: 4.9MB
+    TotalOut: 12MB
+    RateIn: 0B/s
+    RateOut: 0B/s
+`,
 	},
 	Options: []cmds.Option{
-		cmds.StringOption("peer", "p", "specify a peer to print bandwidth for"),
-		cmds.StringOption("proto", "t", "specify a protocol to print bandwidth for"),
-		cmds.BoolOption("poll", "print bandwidth at an interval"),
-		cmds.StringOption("interval", "i", "time interval to wait between updating output"),
+		cmds.StringOption("peer", "p", "Specify a peer to print bandwidth for."),
+		cmds.StringOption("proto", "t", "Specify a protocol to print bandwidth for."),
+		cmds.BoolOption("poll", "Print bandwidth at an interval.").Default(false),
+		cmds.StringOption("interval", "i", `Time interval to wait between updating output, if 'poll' is true.
+
+    This accepts durations such as "300s", "1.5h" or "2h45m". Valid time units are:
+    "ns", "us" (or "µs"), "ms", "s", "m", "h".`).Default("1s"),
 	},
 
 	Run: func(req cmds.Request, res cmds.Response) {
@@ -49,6 +90,11 @@ var statBwCmd = &cmds.Command{
 		// Must be online!
 		if !nd.OnlineMode() {
 			res.SetError(errNotOnline, cmds.ErrClient)
+			return
+		}
+
+		if nd.Reporter == nil {
+			res.SetError(fmt.Errorf("bandwidth reporter disabled in config"), cmds.ErrNormal)
 			return
 		}
 
@@ -78,19 +124,15 @@ var statBwCmd = &cmds.Command{
 			pid = checkpid
 		}
 
-		interval := time.Second
-		timeS, found, err := req.Option("interval").String()
+		timeS, _, err := req.Option("interval").String()
 		if err != nil {
 			res.SetError(err, cmds.ErrNormal)
 			return
 		}
-		if found {
-			v, err := time.ParseDuration(timeS)
-			if err != nil {
-				res.SetError(err, cmds.ErrNormal)
-				return
-			}
-			interval = v
+		interval, err := time.ParseDuration(timeS)
+		if err != nil {
+			res.SetError(err, cmds.ErrNormal)
+			return
 		}
 
 		doPoll, _, err := req.Option("poll").Bool()
@@ -151,14 +193,15 @@ var statBwCmd = &cmds.Command{
 					printStats(out, bs)
 				} else {
 					if first {
-						fmt.Fprintln(out, "Total Up\t Total Down\t Rate Up\t Rate Down")
+						fmt.Fprintln(out, "Total Up    Total Down  Rate Up     Rate Down")
 						first = false
 					}
 					fmt.Fprint(out, "\r")
-					fmt.Fprintf(out, "%s \t\t", humanize.Bytes(uint64(bs.TotalOut)))
-					fmt.Fprintf(out, " %s \t\t", humanize.Bytes(uint64(bs.TotalIn)))
-					fmt.Fprintf(out, " %s/s   \t", humanize.Bytes(uint64(bs.RateOut)))
-					fmt.Fprintf(out, " %s/s     ", humanize.Bytes(uint64(bs.RateIn)))
+					// In the worst case scenario, the humanized output is of form "xxx.x xB", which is 8 characters long
+					fmt.Fprintf(out, "%8s    ", humanize.Bytes(uint64(bs.TotalOut)))
+					fmt.Fprintf(out, "%8s    ", humanize.Bytes(uint64(bs.TotalIn)))
+					fmt.Fprintf(out, "%8s/s  ", humanize.Bytes(uint64(bs.RateOut)))
+					fmt.Fprintf(out, "%8s/s  ", humanize.Bytes(uint64(bs.RateIn)))
 				}
 				return out, nil
 

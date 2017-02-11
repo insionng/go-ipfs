@@ -1,7 +1,16 @@
+COMMIT := $(shell git rev-parse --short HEAD)
+GOFLAGS += -ldflags="-X "github.com/ipfs/go-ipfs/repo/config".CurrentCommit=$(COMMIT)"
+
 all: install
 
-build:
-	go build
+install:
+	go install $(GOFLAGS)
 
-install: build
-	go install
+build:
+	go build -i $(GOFLAGS)
+
+clean:
+	go clean $(GOFLAGS)
+
+uninstall:
+	go clean -i $(GOFLAGS)

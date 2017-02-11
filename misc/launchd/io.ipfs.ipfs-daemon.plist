@@ -8,7 +8,7 @@
     <string>io.ipfs.ipfs-daemon</string>
     <key>ProgramArguments</key>
     <array>
-      <string>ipfs</string>
+      <string>{{IPFS_BIN}}</string>
       <string>daemon</string>
     </array>
     <key>EnvironmentVariables</key>
@@ -18,10 +18,6 @@
     </dict>
     <key>RunAtLoad</key>
     <true/>
-    <key>StandardErrorPath</key>
-    <string>{{IPFS_PATH}}/logs/stderr.log</string>
-    <key>StandardOutPath</key>
-    <string>{{IPFS_PATH}}/logs/stdout.log</string>
   </dict>
 </plist>
 

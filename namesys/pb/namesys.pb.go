@@ -13,7 +13,7 @@ It has these top-level messages:
 */
 package namesys_pb
 
-import proto "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/gogo/protobuf/proto"
+import proto "gx/ipfs/QmZ4Qi3GaRbjcx28Sme5eMH7RQjGkt8wHxt2a65oLaeFEV/gogo-protobuf/proto"
 import math "math"
 
 // Reference imports to suppress errors if they are not otherwise used.
@@ -56,6 +56,8 @@ type IpnsEntry struct {
 	Signature        []byte                  `protobuf:"bytes,2,req,name=signature" json:"signature,omitempty"`
 	ValidityType     *IpnsEntry_ValidityType `protobuf:"varint,3,opt,name=validityType,enum=namesys.pb.IpnsEntry_ValidityType" json:"validityType,omitempty"`
 	Validity         []byte                  `protobuf:"bytes,4,opt,name=validity" json:"validity,omitempty"`
+	Sequence         *uint64                 `protobuf:"varint,5,opt,name=sequence" json:"sequence,omitempty"`
+	Ttl              *uint64                 `protobuf:"varint,6,opt,name=ttl" json:"ttl,omitempty"`
 	XXX_unrecognized []byte                  `json:"-"`
 }
 
@@ -89,6 +91,20 @@ func (m *IpnsEntry) GetValidity() []byte {
 		return m.Validity
 	}
 	return nil
+}
+
+func (m *IpnsEntry) GetSequence() uint64 {
+	if m != nil && m.Sequence != nil {
+		return *m.Sequence
+	}
+	return 0
+}
+
+func (m *IpnsEntry) GetTtl() uint64 {
+	if m != nil && m.Ttl != nil {
+		return *m.Ttl
+	}
+	return 0
 }
 
 func init() {

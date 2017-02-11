@@ -2,6 +2,7 @@ package trickle
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -9,7 +10,6 @@ import (
 	"os"
 	"testing"
 
-	"github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
 	chunk "github.com/ipfs/go-ipfs/importer/chunk"
 	h "github.com/ipfs/go-ipfs/importer/helpers"
 	merkledag "github.com/ipfs/go-ipfs/merkledag"
@@ -17,24 +17,27 @@ import (
 	pin "github.com/ipfs/go-ipfs/pin"
 	ft "github.com/ipfs/go-ipfs/unixfs"
 	uio "github.com/ipfs/go-ipfs/unixfs/io"
-	u "github.com/ipfs/go-ipfs/util"
+
+	u "gx/ipfs/Qmb912gdngC1UWwTkhuW8knyRbcWeu5kqkxBpveLmW8bSr/go-ipfs-util"
 )
 
-func buildTestDag(ds merkledag.DAGService, spl chunk.Splitter) (*merkledag.Node, error) {
-	// Start the splitter
-	blkch, errs := chunk.Chan(spl)
-
+func buildTestDag(ds merkledag.DAGService, spl chunk.Splitter) (*merkledag.ProtoNode, error) {
 	dbp := h.DagBuilderParams{
 		Dagserv:  ds,
 		Maxlinks: h.DefaultLinksPerBlock,
 	}
 
-	nd, err := TrickleLayout(dbp.New(blkch, errs))
+	nd, err := TrickleLayout(dbp.New(spl))
 	if err != nil {
 		return nil, err
 	}
 
-	return nd, VerifyTrickleDagStructure(nd, ds, dbp.Maxlinks, layerRepeat)
+	pbnd, ok := nd.(*merkledag.ProtoNode)
+	if !ok {
+		return nil, merkledag.ErrNotProtobuf
+	}
+
+	return pbnd, VerifyTrickleDagStructure(pbnd, ds, dbp.Maxlinks, layerRepeat)
 }
 
 //Test where calls to read are smaller than the chunk size
@@ -125,7 +128,7 @@ func arrComp(a, b []byte) error {
 
 type dagservAndPinner struct {
 	ds merkledag.DAGService
-	mp pin.ManualPinner
+	mp pin.Pinner
 }
 
 func TestIndirectBlocks(t *testing.T) {
@@ -441,10 +444,9 @@ func TestAppend(t *testing.T) {
 	}
 
 	r := bytes.NewReader(should[nbytes/2:])
-	blks, errs := chunk.Chan(chunk.NewSizeSplitter(r, 500))
 
 	ctx := context.Background()
-	nnode, err := TrickleAppend(ctx, nd, dbp.New(blks, errs))
+	nnode, err := TrickleAppend(ctx, nd, dbp.New(chunk.NewSizeSplitter(r, 500)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -494,9 +496,8 @@ func TestMultipleAppends(t *testing.T) {
 
 	ctx := context.Background()
 	for i := 0; i < len(should); i++ {
-		blks, errs := chunk.Chan(spl(bytes.NewReader(should[i : i+1])))
 
-		nnode, err := TrickleAppend(ctx, nd, dbp.New(blks, errs))
+		nnode, err := TrickleAppend(ctx, nd, dbp.New(spl(bytes.NewReader(should[i:i+1]))))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -528,8 +529,8 @@ func TestAppendSingleBytesToEmpty(t *testing.T) {
 
 	data := []byte("AB")
 
-	nd := new(merkledag.Node)
-	nd.Data = ft.FilePBData(nil, 0)
+	nd := new(merkledag.ProtoNode)
+	nd.SetData(ft.FilePBData(nil, 0))
 
 	dbp := &h.DagBuilderParams{
 		Dagserv:  ds,
@@ -538,17 +539,13 @@ func TestAppendSingleBytesToEmpty(t *testing.T) {
 
 	spl := chunk.SizeSplitterGen(500)
 
-	blks, errs := chunk.Chan(spl(bytes.NewReader(data[:1])))
-
 	ctx := context.Background()
-	nnode, err := TrickleAppend(ctx, nd, dbp.New(blks, errs))
+	nnode, err := TrickleAppend(ctx, nd, dbp.New(spl(bytes.NewReader(data[:1]))))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	blks, errs = chunk.Chan(spl(bytes.NewReader(data[1:])))
-
-	nnode, err = TrickleAppend(ctx, nnode, dbp.New(blks, errs))
+	nnode, err = TrickleAppend(ctx, nnode, dbp.New(spl(bytes.NewReader(data[1:]))))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,8 +567,8 @@ func TestAppendSingleBytesToEmpty(t *testing.T) {
 	}
 }
 
-func printDag(nd *merkledag.Node, ds merkledag.DAGService, indent int) {
-	pbd, err := ft.FromBytes(nd.Data)
+func printDag(nd *merkledag.ProtoNode, ds merkledag.DAGService, indent int) {
+	pbd, err := ft.FromBytes(nd.Data())
 	if err != nil {
 		panic(err)
 	}
@@ -580,17 +577,17 @@ func printDag(nd *merkledag.Node, ds merkledag.DAGService, indent int) {
 		fmt.Print(" ")
 	}
 	fmt.Printf("{size = %d, type = %s, nc = %d", pbd.GetFilesize(), pbd.GetType().String(), len(pbd.GetBlocksizes()))
-	if len(nd.Links) > 0 {
+	if len(nd.Links()) > 0 {
 		fmt.Println()
 	}
-	for _, lnk := range nd.Links {
+	for _, lnk := range nd.Links() {
 		child, err := lnk.GetNode(context.Background(), ds)
 		if err != nil {
 			panic(err)
 		}
-		printDag(child, ds, indent+1)
+		printDag(child.(*merkledag.ProtoNode), ds, indent+1)
 	}
-	if len(nd.Links) > 0 {
+	if len(nd.Links()) > 0 {
 		for i := 0; i < indent; i++ {
 			fmt.Print(" ")
 		}

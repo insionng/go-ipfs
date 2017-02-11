@@ -9,10 +9,11 @@ import (
 	gopath "path"
 	"strings"
 
-	"github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/cheggaaa/pb"
+	"gx/ipfs/QmeWjRodbcZFKe5tMN7poEx3izym6osrLSnTLf9UjJZBbs/pb"
 
 	cmds "github.com/ipfs/go-ipfs/commands"
 	core "github.com/ipfs/go-ipfs/core"
+	dag "github.com/ipfs/go-ipfs/merkledag"
 	path "github.com/ipfs/go-ipfs/path"
 	tar "github.com/ipfs/go-ipfs/thirdparty/tar"
 	uarchive "github.com/ipfs/go-ipfs/unixfs/archive"
@@ -22,12 +23,12 @@ var ErrInvalidCompressionLevel = errors.New("Compression level must be between 1
 
 var GetCmd = &cmds.Command{
 	Helptext: cmds.HelpText{
-		Tagline: "Download IPFS objects",
+		Tagline: "Download IPFS objects.",
 		ShortDescription: `
-Retrieves the object named by <ipfs-or-ipns-path> and stores the data to disk.
+Stores to disk the data contained an IPFS or IPNS object(s) at the given path.
 
-By default, the output will be stored at ./<ipfs-path>, but an alternate path
-can be specified with '--output=<path>' or '-o=<path>'.
+By default, the output will be stored at './<ipfs-path>', but an alternate
+path can be specified with '--output=<path>' or '-o=<path>'.
 
 To output a TAR archive instead of unpacked files, use '--archive' or '-a'.
 
@@ -37,13 +38,13 @@ may also specify the level of compression by specifying '-l=<1-9>'.
 	},
 
 	Arguments: []cmds.Argument{
-		cmds.StringArg("ipfs-path", true, false, "The path to the IPFS object(s) to be outputted").EnableStdin(),
+		cmds.StringArg("ipfs-path", true, false, "The path to the IPFS object(s) to be outputted.").EnableStdin(),
 	},
 	Options: []cmds.Option{
-		cmds.StringOption("output", "o", "The path where output should be stored"),
-		cmds.BoolOption("archive", "a", "Output a TAR archive"),
-		cmds.BoolOption("compress", "C", "Compress the output with GZIP compression"),
-		cmds.IntOption("compression-level", "l", "The level of compression (1-9)"),
+		cmds.StringOption("output", "o", "The path where the output should be stored."),
+		cmds.BoolOption("archive", "a", "Output a TAR archive.").Default(false),
+		cmds.BoolOption("compress", "C", "Compress the output with GZIP compression.").Default(false),
+		cmds.IntOption("compression-level", "l", "The level of compression (1-9).").Default(-1),
 	},
 	PreRun: func(req cmds.Request) error {
 		_, err := getCompressOptions(req)
@@ -63,14 +64,28 @@ may also specify the level of compression by specifying '-l=<1-9>'.
 		}
 		p := path.Path(req.Arguments()[0])
 		ctx := req.Context()
-		dn, err := core.Resolve(ctx, node, p)
+		dn, err := core.Resolve(ctx, node.Namesys, node.Resolver, p)
 		if err != nil {
 			res.SetError(err, cmds.ErrNormal)
 			return
 		}
 
+		pbnd, ok := dn.(*dag.ProtoNode)
+		if !ok {
+			res.SetError(err, cmds.ErrNormal)
+			return
+		}
+
+		size, err := dn.Size()
+		if err != nil {
+			res.SetError(err, cmds.ErrNormal)
+			return
+		}
+
+		res.SetLength(size)
+
 		archive, _, _ := req.Option("archive").Bool()
-		reader, err := uarchive.DagArchive(ctx, dn, p.String(), node.DAG, archive, cmplvl)
+		reader, err := uarchive.DagArchive(ctx, pbnd, p.String(), node.DAG, archive, cmplvl)
 		if err != nil {
 			res.SetError(err, cmds.ErrNormal)
 			return
@@ -103,6 +118,7 @@ may also specify the level of compression by specifying '-l=<1-9>'.
 			Err:         os.Stderr,
 			Archive:     archive,
 			Compression: cmplvl,
+			Size:        int64(res.Length()),
 		}
 
 		if err := gw.Write(outReader, outPath); err != nil {
@@ -112,13 +128,35 @@ may also specify the level of compression by specifying '-l=<1-9>'.
 	},
 }
 
-func progressBarForReader(out io.Writer, r io.Reader) (*pb.ProgressBar, *pb.Reader) {
+type clearlineReader struct {
+	io.Reader
+	out io.Writer
+}
+
+func (r *clearlineReader) Read(p []byte) (n int, err error) {
+	n, err = r.Reader.Read(p)
+	if err == io.EOF {
+		// callback
+		fmt.Fprintf(r.out, "\033[2K\r") // clear progress bar line on EOF
+	}
+	return
+}
+
+func progressBarForReader(out io.Writer, r io.Reader, l int64) (*pb.ProgressBar, io.Reader) {
 	// setup bar reader
 	// TODO: get total length of files
-	bar := pb.New(0).SetUnits(pb.U_BYTES)
+	bar := pb.New64(l).SetUnits(pb.U_BYTES)
 	bar.Output = out
+
+	// the progress bar lib doesn't give us a way to get the width of the output,
+	// so as a hack we just use a callback to measure the output, then git rid of it
+	bar.Callback = func(line string) {
+		terminalWidth := len(line)
+		bar.Callback = nil
+		log.Infof("terminal width: %v\n", terminalWidth)
+	}
 	barR := bar.NewProxyReader(r)
-	return bar, barR
+	return bar, &clearlineReader{barR, out}
 }
 
 type getWriter struct {
@@ -127,6 +165,7 @@ type getWriter struct {
 
 	Archive     bool
 	Compression int
+	Size        int64
 }
 
 func (gw *getWriter) Write(r io.Reader, fpath string) error {
@@ -159,7 +198,7 @@ func (gw *getWriter) writeArchive(r io.Reader, fpath string) error {
 	defer file.Close()
 
 	fmt.Fprintf(gw.Out, "Saving archive to %s\n", fpath)
-	bar, barR := progressBarForReader(gw.Err, r)
+	bar, barR := progressBarForReader(gw.Err, r, gw.Size)
 	bar.Start()
 	defer bar.Finish()
 
@@ -169,7 +208,7 @@ func (gw *getWriter) writeArchive(r io.Reader, fpath string) error {
 
 func (gw *getWriter) writeExtracted(r io.Reader, fpath string) error {
 	fmt.Fprintf(gw.Out, "Saving file(s) to %s\n", fpath)
-	bar, barR := progressBarForReader(gw.Err, r)
+	bar, barR := progressBarForReader(gw.Err, r, gw.Size)
 	bar.Start()
 	defer bar.Finish()
 
@@ -188,5 +227,5 @@ func getCompressOptions(req cmds.Request) (int, error) {
 	case cmprs && cmplvlFound && (cmplvl < 1 || cmplvl > 9):
 		return gzip.NoCompression, ErrInvalidCompressionLevel
 	}
-	return gzip.NoCompression, nil
+	return cmplvl, nil
 }

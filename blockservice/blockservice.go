@@ -4,105 +4,153 @@
 package blockservice
 
 import (
+	"context"
 	"errors"
+	"fmt"
 
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
 	blocks "github.com/ipfs/go-ipfs/blocks"
 	"github.com/ipfs/go-ipfs/blocks/blockstore"
-	key "github.com/ipfs/go-ipfs/blocks/key"
-	worker "github.com/ipfs/go-ipfs/blockservice/worker"
 	exchange "github.com/ipfs/go-ipfs/exchange"
-	u "github.com/ipfs/go-ipfs/util"
+
+	logging "gx/ipfs/QmSpJByNKFX1sCsHBEp3R73FL4NF6FnQTEGyNAXHm2GS52/go-log"
+	cid "gx/ipfs/QmcTcsTvfaeEBRFo1TkFgT8sRmgi1n1LTZpecfVP8fzpGD/go-cid"
 )
 
-var wc = worker.Config{
-	// When running on a single core, NumWorkers has a harsh negative effect on
-	// throughput. (-80% when < 25)
-	// Running a lot more workers appears to have very little effect on both
-	// single and multicore configurations.
-	NumWorkers: 25,
+var log = logging.Logger("blockservice")
 
-	// These have no effect on when running on multiple cores, but harsh
-	// negative effect on throughput when running on a single core
-	// On multicore configurations these buffers have little effect on
-	// throughput.
-	// On single core configurations, larger buffers have severe adverse
-	// effects on throughput.
-	ClientBufferSize: 0,
-	WorkerBufferSize: 0,
-}
-
-var log = u.Logger("blockservice")
 var ErrNotFound = errors.New("blockservice: key not found")
 
 // BlockService is a hybrid block datastore. It stores data in a local
 // datastore and may retrieve data from a remote Exchange.
 // It uses an internal `datastore.Datastore` instance to store values.
-type BlockService struct {
-	// TODO don't expose underlying impl details
-	Blockstore blockstore.Blockstore
-	Exchange   exchange.Interface
+type BlockService interface {
+	Blockstore() blockstore.Blockstore
+	Exchange() exchange.Interface
+	AddBlock(o blocks.Block) (*cid.Cid, error)
+	AddBlocks(bs []blocks.Block) ([]*cid.Cid, error)
+	GetBlock(ctx context.Context, c *cid.Cid) (blocks.Block, error)
+	GetBlocks(ctx context.Context, ks []*cid.Cid) <-chan blocks.Block
+	DeleteBlock(o blocks.Block) error
+	Close() error
+}
 
-	worker *worker.Worker
+type blockService struct {
+	blockstore blockstore.Blockstore
+	exchange   exchange.Interface
+	// If checkFirst is true then first check that a block doesn't
+	// already exist to avoid republishing the block on the exchange.
+	checkFirst bool
 }
 
 // NewBlockService creates a BlockService with given datastore instance.
-func New(bs blockstore.Blockstore, rem exchange.Interface) *BlockService {
+func New(bs blockstore.Blockstore, rem exchange.Interface) BlockService {
 	if rem == nil {
 		log.Warning("blockservice running in local (offline) mode.")
 	}
 
-	return &BlockService{
-		Blockstore: bs,
-		Exchange:   rem,
-		worker:     worker.NewWorker(rem, wc),
+	return &blockService{
+		blockstore: bs,
+		exchange:   rem,
+		checkFirst: true,
 	}
+}
+
+// NewWriteThrough ceates a BlockService that guarantees writes will go
+// through to the blockstore and are not skipped by cache checks.
+func NewWriteThrough(bs blockstore.Blockstore, rem exchange.Interface) BlockService {
+	if rem == nil {
+		log.Warning("blockservice running in local (offline) mode.")
+	}
+
+	return &blockService{
+		blockstore: bs,
+		exchange:   rem,
+		checkFirst: false,
+	}
+}
+
+func (bs *blockService) Blockstore() blockstore.Blockstore {
+	return bs.blockstore
+}
+
+func (bs *blockService) Exchange() exchange.Interface {
+	return bs.exchange
 }
 
 // AddBlock adds a particular block to the service, Putting it into the datastore.
 // TODO pass a context into this if the remote.HasBlock is going to remain here.
-func (s *BlockService) AddBlock(b *blocks.Block) (key.Key, error) {
-	k := b.Key()
-	err := s.Blockstore.Put(b)
-	if err != nil {
-		return k, err
-	}
-	if err := s.worker.HasBlock(b); err != nil {
-		return "", errors.New("blockservice is closed")
-	}
-	return k, nil
-}
+func (s *blockService) AddBlock(o blocks.Block) (*cid.Cid, error) {
+	c := o.Cid()
+	if s.checkFirst {
+		has, err := s.blockstore.Has(c)
+		if err != nil {
+			return nil, err
+		}
 
-func (s *BlockService) AddBlocks(bs []*blocks.Block) ([]key.Key, error) {
-	err := s.Blockstore.PutMany(bs)
+		if has {
+			return c, nil
+		}
+	}
+
+	err := s.blockstore.Put(o)
 	if err != nil {
 		return nil, err
 	}
 
-	var ks []key.Key
-	for _, b := range bs {
-		if err := s.worker.HasBlock(b); err != nil {
-			return nil, errors.New("blockservice is closed")
+	if err := s.exchange.HasBlock(o); err != nil {
+		return nil, errors.New("blockservice is closed")
+	}
+
+	return c, nil
+}
+
+func (s *blockService) AddBlocks(bs []blocks.Block) ([]*cid.Cid, error) {
+	var toput []blocks.Block
+	if s.checkFirst {
+		for _, b := range bs {
+			has, err := s.blockstore.Has(b.Cid())
+			if err != nil {
+				return nil, err
+			}
+			if !has {
+				toput = append(toput, b)
+			}
 		}
-		ks = append(ks, b.Key())
+	} else {
+		toput = bs
+	}
+
+	err := s.blockstore.PutMany(toput)
+	if err != nil {
+		return nil, err
+	}
+
+	var ks []*cid.Cid
+	for _, o := range toput {
+		if err := s.exchange.HasBlock(o); err != nil {
+			return nil, fmt.Errorf("blockservice is closed (%s)", err)
+		}
+
+		ks = append(ks, o.Cid())
 	}
 	return ks, nil
 }
 
 // GetBlock retrieves a particular block from the service,
 // Getting it from the datastore using the key (hash).
-func (s *BlockService) GetBlock(ctx context.Context, k key.Key) (*blocks.Block, error) {
-	log.Debugf("BlockService GetBlock: '%s'", k)
-	block, err := s.Blockstore.Get(k)
+func (s *blockService) GetBlock(ctx context.Context, c *cid.Cid) (blocks.Block, error) {
+	log.Debugf("BlockService GetBlock: '%s'", c)
+
+	block, err := s.blockstore.Get(c)
 	if err == nil {
 		return block, nil
 	}
 
-	if err == blockstore.ErrNotFound && s.Exchange != nil {
+	if err == blockstore.ErrNotFound && s.exchange != nil {
 		// TODO be careful checking ErrNotFound. If the underlying
 		// implementation changes, this will break.
-		log.Debug("Blockservice: Searching bitswap.")
-		blk, err := s.Exchange.GetBlock(ctx, k)
+		log.Debug("Blockservice: Searching bitswap")
+		blk, err := s.exchange.GetBlock(ctx, c)
 		if err != nil {
 			if err == blockstore.ErrNotFound {
 				return nil, ErrNotFound
@@ -112,7 +160,7 @@ func (s *BlockService) GetBlock(ctx context.Context, k key.Key) (*blocks.Block, 
 		return blk, nil
 	}
 
-	log.Debug("Blockservice GetBlock: Not found.")
+	log.Debug("Blockservice GetBlock: Not found")
 	if err == blockstore.ErrNotFound {
 		return nil, ErrNotFound
 	}
@@ -123,18 +171,18 @@ func (s *BlockService) GetBlock(ctx context.Context, k key.Key) (*blocks.Block, 
 // GetBlocks gets a list of blocks asynchronously and returns through
 // the returned channel.
 // NB: No guarantees are made about order.
-func (s *BlockService) GetBlocks(ctx context.Context, ks []key.Key) <-chan *blocks.Block {
-	out := make(chan *blocks.Block, 0)
+func (s *blockService) GetBlocks(ctx context.Context, ks []*cid.Cid) <-chan blocks.Block {
+	out := make(chan blocks.Block, 0)
 	go func() {
 		defer close(out)
-		var misses []key.Key
-		for _, k := range ks {
-			hit, err := s.Blockstore.Get(k)
+		var misses []*cid.Cid
+		for _, c := range ks {
+			hit, err := s.blockstore.Get(c)
 			if err != nil {
-				misses = append(misses, k)
+				misses = append(misses, c)
 				continue
 			}
-			log.Debug("Blockservice: Got data in datastore.")
+			log.Debug("Blockservice: Got data in datastore")
 			select {
 			case out <- hit:
 			case <-ctx.Done():
@@ -142,7 +190,11 @@ func (s *BlockService) GetBlocks(ctx context.Context, ks []key.Key) <-chan *bloc
 			}
 		}
 
-		rblocks, err := s.Exchange.GetBlocks(ctx, misses)
+		if len(misses) == 0 {
+			return
+		}
+
+		rblocks, err := s.exchange.GetBlocks(ctx, misses)
 		if err != nil {
 			log.Debugf("Error with GetBlocks: %s", err)
 			return
@@ -160,11 +212,11 @@ func (s *BlockService) GetBlocks(ctx context.Context, ks []key.Key) <-chan *bloc
 }
 
 // DeleteBlock deletes a block in the blockservice from the datastore
-func (s *BlockService) DeleteBlock(k key.Key) error {
-	return s.Blockstore.DeleteBlock(k)
+func (s *blockService) DeleteBlock(o blocks.Block) error {
+	return s.blockstore.DeleteBlock(o.Cid())
 }
 
-func (s *BlockService) Close() error {
+func (s *blockService) Close() error {
 	log.Debug("blockservice is shutting down...")
-	return s.worker.Close()
+	return s.exchange.Close()
 }

@@ -8,19 +8,23 @@ import (
 	"io"
 	"strings"
 
-	b58 "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-base58"
+	b58 "gx/ipfs/QmT8rehPR3F6bmwL6zjUN8XpiDBFFpMP2myPdC6ApsWfJf/go-base58"
 
 	cmds "github.com/ipfs/go-ipfs/commands"
 	core "github.com/ipfs/go-ipfs/core"
-	ic "github.com/ipfs/go-ipfs/p2p/crypto"
-	"github.com/ipfs/go-ipfs/p2p/peer"
-	identify "github.com/ipfs/go-ipfs/p2p/protocol/identify"
-	kb "github.com/ipfs/go-ipfs/routing/kbucket"
-	u "github.com/ipfs/go-ipfs/util"
+	kb "gx/ipfs/QmRVHVr38ChANF2PUMNKQs7Q4uVWCLVabrfcTG9taNbcVy/go-libp2p-kbucket"
+
+	u "gx/ipfs/Qmb912gdngC1UWwTkhuW8knyRbcWeu5kqkxBpveLmW8bSr/go-ipfs-util"
+	identify "gx/ipfs/QmdzDdLZ7nj133QvNHypyS9Y39g35bMFk5DJ2pmX7YqtKU/go-libp2p/p2p/protocol/identify"
+	pstore "gx/ipfs/QmeXj9VAjmYQZxpmVz7VzccbJrpmr8qkCDSjfVNsPTWTYU/go-libp2p-peerstore"
+	"gx/ipfs/QmfMmLGoKzCHDN7cGgk64PJr4iipzidDRME8HABSJqvmhC/go-libp2p-peer"
+	ic "gx/ipfs/QmfWDLQjGjVe4fr5CoztYW2DYYjRysMJrFe1RCsXLPTf46/go-libp2p-crypto"
 )
 
-const offlineIdErrorMessage = `ID command fails when run without daemon, we are working to fix this.
-In the meantime, please run the daemon if you want to use 'ipfs id':
+const offlineIdErrorMessage = `'ipfs id' currently cannot query information on remote
+peers without a running daemon; we are working to fix this.
+In the meantime, if you want to query remote peers using 'ipfs id',
+please run the daemon:
 
     ipfs daemon &
     ipfs id QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ
@@ -36,24 +40,28 @@ type IdOutput struct {
 
 var IDCmd = &cmds.Command{
 	Helptext: cmds.HelpText{
-		Tagline: "Show IPFS Node ID info",
+		Tagline: "Show ipfs node id info.",
 		ShortDescription: `
-Prints out information about the specified peer,
-if no peer is specified, prints out local peers info.
+Prints out information about the specified peer.
+If no peer is specified, prints out information for local peers.
 
-ipfs id supports the format option for output with the following keys:
-<id> : the peers id
-<aver>: agent version
-<pver>: protocol version
-<pubkey>: public key
-<addrs>: addresses (newline delimited)
+'ipfs id' supports the format option for output with the following keys:
+<id> : The peers id.
+<aver>: Agent version.
+<pver>: Protocol version.
+<pubkey>: Public key.
+<addrs>: Addresses (newline delimited).
+
+EXAMPLE:
+
+    ipfs id Qmece2RkXhsKe5CRooNisBTh4SK119KrXXGmoK6V3kb8aH -f="<addrs>\n"
 `,
 	},
 	Arguments: []cmds.Argument{
-		cmds.StringArg("peerid", false, false, "peer.ID of node to look up").EnableStdin(),
+		cmds.StringArg("peerid", false, false, "Peer.ID of node to look up."),
 	},
 	Options: []cmds.Option{
-		cmds.StringOption("f", "format", "optional output format"),
+		cmds.StringOption("format", "f", "Optional output format."),
 	},
 	Run: func(req cmds.Request, res cmds.Response) {
 		node, err := req.InvocContext().GetNode()
@@ -62,21 +70,24 @@ ipfs id supports the format option for output with the following keys:
 			return
 		}
 
-		if len(req.Arguments()) == 0 {
+		var id peer.ID
+		if len(req.Arguments()) > 0 {
+			id = peer.ID(b58.Decode(req.Arguments()[0]))
+			if len(id) == 0 {
+				res.SetError(cmds.ClientError("Invalid peer id"), cmds.ErrClient)
+				return
+			}
+		} else {
+			id = node.Identity
+		}
+
+		if id == node.Identity {
 			output, err := printSelf(node)
 			if err != nil {
 				res.SetError(err, cmds.ErrNormal)
 				return
 			}
 			res.SetOutput(output)
-			return
-		}
-
-		pid := req.Arguments()[0]
-
-		id := peer.ID(b58.Decode(pid))
-		if len(id) == 0 {
-			res.SetError(cmds.ClientError("Invalid peer id"), cmds.ErrClient)
 			return
 		}
 
@@ -130,6 +141,7 @@ ipfs id supports the format option for output with the following keys:
 				if err != nil {
 					return nil, err
 				}
+				marshaled = append(marshaled, byte('\n'))
 				return bytes.NewReader(marshaled), nil
 			}
 		},
@@ -137,7 +149,7 @@ ipfs id supports the format option for output with the following keys:
 	Type: IdOutput{},
 }
 
-func printPeer(ps peer.Peerstore, p peer.ID) (interface{}, error) {
+func printPeer(ps pstore.Peerstore, p peer.ID) (interface{}, error) {
 	if p == "" {
 		return nil, errors.New("Attempted to print nil peer!")
 	}
@@ -195,7 +207,7 @@ func printSelf(node *core.IpfsNode) (interface{}, error) {
 			info.Addresses = append(info.Addresses, s)
 		}
 	}
-	info.ProtocolVersion = identify.IpfsVersion
+	info.ProtocolVersion = identify.LibP2PVersion
 	info.AgentVersion = identify.ClientVersion
 	return info, nil
 }

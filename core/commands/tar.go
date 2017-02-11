@@ -6,13 +6,15 @@ import (
 
 	cmds "github.com/ipfs/go-ipfs/commands"
 	core "github.com/ipfs/go-ipfs/core"
+	"github.com/ipfs/go-ipfs/core/coreunix"
+	dag "github.com/ipfs/go-ipfs/merkledag"
 	path "github.com/ipfs/go-ipfs/path"
 	tar "github.com/ipfs/go-ipfs/tar"
 )
 
 var TarCmd = &cmds.Command{
 	Helptext: cmds.HelpText{
-		Tagline: "utility functions for tar files in ipfs",
+		Tagline: "Utility functions for tar files in ipfs.",
 	},
 
 	Subcommands: map[string]*cmds.Command{
@@ -23,14 +25,15 @@ var TarCmd = &cmds.Command{
 
 var tarAddCmd = &cmds.Command{
 	Helptext: cmds.HelpText{
-		Tagline: "import a tar file into ipfs",
+		Tagline: "Import a tar file into ipfs.",
 		ShortDescription: `
-'ipfs tar add' will parse a tar file and create a merkledag structure to represent it.
+'ipfs tar add' will parse a tar file and create a merkledag structure to
+represent it.
 `,
 	},
 
 	Arguments: []cmds.Argument{
-		cmds.FileArg("file", true, false, "tar file to add").EnableStdin(),
+		cmds.FileArg("file", true, false, "Tar file to add.").EnableStdin(),
 	},
 	Run: func(req cmds.Request, res cmds.Response) {
 		nd, err := req.InvocContext().GetNode()
@@ -51,37 +54,33 @@ var tarAddCmd = &cmds.Command{
 			return
 		}
 
-		k, err := node.Key()
-		if err != nil {
-			res.SetError(err, cmds.ErrNormal)
-			return
-		}
+		c := node.Cid()
 
 		fi.FileName()
-		res.SetOutput(&AddedObject{
+		res.SetOutput(&coreunix.AddedObject{
 			Name: fi.FileName(),
-			Hash: k.B58String(),
+			Hash: c.String(),
 		})
 	},
-	Type: AddedObject{},
+	Type: coreunix.AddedObject{},
 	Marshalers: cmds.MarshalerMap{
 		cmds.Text: func(res cmds.Response) (io.Reader, error) {
-			o := res.Output().(*AddedObject)
-			return strings.NewReader(o.Hash), nil
+			o := res.Output().(*coreunix.AddedObject)
+			return strings.NewReader(o.Hash + "\n"), nil
 		},
 	},
 }
 
 var tarCatCmd = &cmds.Command{
 	Helptext: cmds.HelpText{
-		Tagline: "export a tar file from ipfs",
+		Tagline: "Export a tar file from IPFS.",
 		ShortDescription: `
-'ipfs tar cat' will export a tar file from a previously imported one in ipfs
+'ipfs tar cat' will export a tar file from a previously imported one in IPFS.
 `,
 	},
 
 	Arguments: []cmds.Argument{
-		cmds.StringArg("path", true, false, "ipfs path of archive to export").EnableStdin(),
+		cmds.StringArg("path", true, false, "ipfs path of archive to export.").EnableStdin(),
 	},
 	Run: func(req cmds.Request, res cmds.Response) {
 		nd, err := req.InvocContext().GetNode()
@@ -96,13 +95,19 @@ var tarCatCmd = &cmds.Command{
 			return
 		}
 
-		root, err := core.Resolve(req.Context(), nd, p)
+		root, err := core.Resolve(req.Context(), nd.Namesys, nd.Resolver, p)
 		if err != nil {
 			res.SetError(err, cmds.ErrNormal)
 			return
 		}
 
-		r, err := tar.ExportTar(req.Context(), root, nd.DAG)
+		rootpb, ok := root.(*dag.ProtoNode)
+		if !ok {
+			res.SetError(dag.ErrNotProtobuf, cmds.ErrNormal)
+			return
+		}
+
+		r, err := tar.ExportTar(req.Context(), rootpb, nd.DAG)
 		if err != nil {
 			res.SetError(err, cmds.ErrNormal)
 			return

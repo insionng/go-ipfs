@@ -10,11 +10,12 @@ import (
 
 	cmds "github.com/ipfs/go-ipfs/commands"
 	core "github.com/ipfs/go-ipfs/core"
-	peer "github.com/ipfs/go-ipfs/p2p/peer"
-	u "github.com/ipfs/go-ipfs/util"
+	u "gx/ipfs/Qmb912gdngC1UWwTkhuW8knyRbcWeu5kqkxBpveLmW8bSr/go-ipfs-util"
+	pstore "gx/ipfs/QmeXj9VAjmYQZxpmVz7VzccbJrpmr8qkCDSjfVNsPTWTYU/go-libp2p-peerstore"
+	peer "gx/ipfs/QmfMmLGoKzCHDN7cGgk64PJr4iipzidDRME8HABSJqvmhC/go-libp2p-peer"
 
-	ma "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-multiaddr"
-	context "github.com/ipfs/go-ipfs/Godeps/_workspace/src/golang.org/x/net/context"
+	context "context"
+	ma "gx/ipfs/QmUAQaWbKxGCUTuoQVvvicbQNZ9APF5pDGWyAZSe93AtKH/go-multiaddr"
 )
 
 const kPingTimeout = 10 * time.Second
@@ -27,21 +28,18 @@ type PingResult struct {
 
 var PingCmd = &cmds.Command{
 	Helptext: cmds.HelpText{
-		Tagline: "send echo request packets to IPFS hosts",
-		Synopsis: `
-Send pings to a peer using the routing system to discover its address
-		`,
+		Tagline: "Send echo request packets to IPFS hosts.",
 		ShortDescription: `
-ipfs ping is a tool to test sending data to other nodes. It finds nodes
-via the routing system, send pings, wait for pongs, and print out round-
+'ipfs ping' is a tool to test sending data to other nodes. It finds nodes
+via the routing system, sends pings, waits for pongs, and prints out round-
 trip latency information.
 		`,
 	},
 	Arguments: []cmds.Argument{
-		cmds.StringArg("peer ID", true, true, "ID of peer to be pinged").EnableStdin(),
+		cmds.StringArg("peer ID", true, true, "ID of peer to be pinged.").EnableStdin(),
 	},
 	Options: []cmds.Option{
-		cmds.IntOption("count", "n", "number of ping messages to send"),
+		cmds.IntOption("count", "n", "Number of ping messages to send.").Default(10),
 	},
 	Marshalers: cmds.MarshalerMap{
 		cmds.Text: func(res cmds.Response) (io.Reader, error) {
@@ -96,18 +94,13 @@ trip latency information.
 		}
 
 		if addr != nil {
-			n.Peerstore.AddAddr(peerID, addr, peer.TempAddrTTL) // temporary
+			n.Peerstore.AddAddr(peerID, addr, pstore.TempAddrTTL) // temporary
 		}
 
-		// Set up number of pings
-		numPings := 10
-		val, found, err := req.Option("count").Int()
+		numPings, _, err := req.Option("count").Int()
 		if err != nil {
 			res.SetError(err, cmds.ErrNormal)
 			return
-		}
-		if found {
-			numPings = val
 		}
 
 		outChan := pingPeer(ctx, n, peerID, numPings)
@@ -124,7 +117,8 @@ func pingPeer(ctx context.Context, n *core.IpfsNode, pid peer.ID, numPings int) 
 		if len(n.Peerstore.Addrs(pid)) == 0 {
 			// Make sure we can find the node in question
 			outChan <- &PingResult{
-				Text: fmt.Sprintf("Looking up peer %s", pid.Pretty()),
+				Text:    fmt.Sprintf("Looking up peer %s", pid.Pretty()),
+				Success: true,
 			}
 
 			ctx, cancel := context.WithTimeout(ctx, kPingTimeout)
@@ -134,17 +128,23 @@ func pingPeer(ctx context.Context, n *core.IpfsNode, pid peer.ID, numPings int) 
 				outChan <- &PingResult{Text: fmt.Sprintf("Peer lookup error: %s", err)}
 				return
 			}
-			n.Peerstore.AddAddrs(p.ID, p.Addrs, peer.TempAddrTTL)
+			n.Peerstore.AddAddrs(p.ID, p.Addrs, pstore.TempAddrTTL)
 		}
 
-		outChan <- &PingResult{Text: fmt.Sprintf("PING %s.", pid.Pretty())}
+		outChan <- &PingResult{
+			Text:    fmt.Sprintf("PING %s.", pid.Pretty()),
+			Success: true,
+		}
 
 		ctx, cancel := context.WithTimeout(ctx, kPingTimeout*time.Duration(numPings))
 		defer cancel()
 		pings, err := n.Ping.Ping(ctx, pid)
 		if err != nil {
 			log.Debugf("Ping error: %s", err)
-			outChan <- &PingResult{Text: fmt.Sprintf("Ping error: %s", err)}
+			outChan <- &PingResult{
+				Success: false,
+				Text:    fmt.Sprintf("Ping error: %s", err),
+			}
 			return
 		}
 
@@ -171,7 +171,8 @@ func pingPeer(ctx context.Context, n *core.IpfsNode, pid peer.ID, numPings int) 
 		}
 		averagems := total.Seconds() * 1000 / float64(numPings)
 		outChan <- &PingResult{
-			Text: fmt.Sprintf("Average latency: %.2fms", averagems),
+			Success: true,
+			Text:    fmt.Sprintf("Average latency: %.2fms", averagems),
 		}
 	}()
 	return outChan

@@ -9,11 +9,10 @@ test_description="Test HTTP Gateway"
 . lib/test-lib.sh
 
 test_init_ipfs
-test_config_ipfs_gateway_readonly $ADDR_GWAY
 test_launch_ipfs_daemon
 
-port=$PORT_GWAY
-apiport=$PORT_API
+port=$GWAY_PORT
+apiport=$API_PORT
 
 # TODO check both 5001 and 5002.
 # 5001 should have a readable gateway (part of the API)
@@ -22,19 +21,19 @@ apiport=$PORT_API
 # define a function to test a gateway, and do so for each port.
 # for now we check 5001 here as 5002 will be checked in gateway-writable.
 
-test_expect_success "GET IPFS path succeeds" '
+test_expect_success "Make a file to test with" '
   echo "Hello Worlds!" >expected &&
-  HASH=$(ipfs add -q expected) &&
+  HASH=$(ipfs add -q expected) ||
+	test_fsh cat daemon_err
+'
+
+test_expect_success "GET IPFS path succeeds" '
   curl -sfo actual "http://127.0.0.1:$port/ipfs/$HASH"
 '
 
 test_expect_success "GET IPFS path output looks good" '
   test_cmp expected actual &&
   rm actual
-'
-
-test_expect_success "GET IPFS path on API forbidden" '
-  test_curl_resp_http_code "http://127.0.0.1:$apiport/ipfs/$HASH" "HTTP/1.1 403 Forbidden"
 '
 
 test_expect_success "GET IPFS directory path succeeds" '
@@ -59,8 +58,9 @@ test_expect_success "GET IPFS non existent file returns code expected (404)" '
 
 test_expect_failure "GET IPNS path succeeds" '
   ipfs name publish "$HASH" &&
-  NAME=$(ipfs config Identity.PeerID) &&
-  curl -sfo actual "http://127.0.0.1:$port/ipns/$NAME"
+  PEERID=$(ipfs config Identity.PeerID) &&
+  test_check_peerid "$PEERID" &&
+  curl -sfo actual "http://127.0.0.1:$port/ipns/$PEERID"
 '
 
 test_expect_failure "GET IPNS path output looks good" '
@@ -91,6 +91,36 @@ test_expect_success "log output looks good" '
 	grep "log API client connected" log_out
 '
 
+test_expect_success "GET /api/v0/version succeeds" '
+	curl -v "http://127.0.0.1:$apiport/api/v0/version" 2> version_out
+'
+
+test_expect_success "output only has one transfer encoding header" '
+	grep "Transfer-Encoding: chunked" version_out | wc -l | xargs echo > tecount_out &&
+	echo "1" > tecount_exp &&
+	test_cmp tecount_out tecount_exp
+'
+
+test_expect_success "setup index hash" '
+	mkdir index &&
+	echo "<p></p>" > index/index.html &&
+	INDEXHASH=$(ipfs add -q -r index | tail -n1)
+	echo index: $INDEXHASH
+'
+
+test_expect_success "GET 'index.html' has correct content type" '
+	curl -I "http://127.0.0.1:$port/ipfs/$INDEXHASH/" > indexout
+'
+
+test_expect_success "output looks good" '
+	grep "Content-Type: text/html" indexout
+'
+
+test_expect_success "HEAD 'index.html' has no content" '
+	curl -X HEAD --max-time 1 http://127.0.0.1:$port/ipfs/$INDEXHASH/ > output;
+	[ ! -s output ]
+'
+
 # test ipfs readonly api
 
 test_curl_gateway_api() {
@@ -113,6 +143,16 @@ test_expect_success "test gateway api is sanitized" '
 for cmd in "add" "block/put" "bootstrap" "config" "dht" "diag" "dns" "get" "id" "mount" "name/publish" "object/put" "object/new" "object/patch" "pin" "ping" "refs/local" "repo" "resolve" "stats" "swarm" "tour" "file" "update" "version" "bitswap"; do
     test_curl_resp_http_code "http://127.0.0.1:$port/api/v0/$cmd" "HTTP/1.1 404 Not Found"
   done
+'
+
+test_expect_success "create raw-leaves node" '
+  echo "This is RAW!" > rfile &&
+  echo "This is RAW!" | ipfs add --raw-leaves -q > rhash
+'
+
+test_expect_success "try fetching it from gateway" '
+  curl http://127.0.0.1:$port/ipfs/$(cat rhash) > ffile &&
+  test_cmp rfile ffile
 '
 
 test_kill_ipfs_daemon

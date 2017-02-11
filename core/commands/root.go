@@ -5,16 +5,14 @@ import (
 	"strings"
 
 	cmds "github.com/ipfs/go-ipfs/commands"
+	dag "github.com/ipfs/go-ipfs/core/commands/dag"
+	files "github.com/ipfs/go-ipfs/core/commands/files"
+	ocmd "github.com/ipfs/go-ipfs/core/commands/object"
 	unixfs "github.com/ipfs/go-ipfs/core/commands/unixfs"
-	evlog "github.com/ipfs/go-ipfs/thirdparty/eventlog"
+	logging "gx/ipfs/QmSpJByNKFX1sCsHBEp3R73FL4NF6FnQTEGyNAXHm2GS52/go-log"
 )
 
-var log = evlog.Logger("core/commands")
-
-type TestOutput struct {
-	Foo string
-	Bar int
-}
+var log = logging.Logger("core/commands")
 
 const (
 	ApiOption = "api"
@@ -22,62 +20,70 @@ const (
 
 var Root = &cmds.Command{
 	Helptext: cmds.HelpText{
-		Tagline: "global p2p merkle-dag filesystem",
-		Synopsis: `
-ipfs [<flags>] <command> [<arg>] ...
-`,
-		ShortDescription: `
+		Tagline:  "Global p2p merkle-dag filesystem.",
+		Synopsis: "ipfs [--config=<config> | -c] [--debug=<debug> | -D] [--help=<help>] [-h=<h>] [--local=<local> | -L] [--api=<api>] <command> ...",
+		Subcommands: `
 BASIC COMMANDS
-
-    init          Initialize ipfs local configuration
-    add <path>    Add an object to ipfs
-    cat <ref>     Show ipfs object data
-    get <ref>     Download ipfs objects
-    ls <ref>      List links from an object
-    refs <ref>    List hashes of links from an object
+  init          Initialize ipfs local configuration
+  add <path>    Add a file to IPFS
+  cat <ref>     Show IPFS object data
+  get <ref>     Download IPFS objects
+  ls <ref>      List links from an object
+  refs <ref>    List hashes of links from an object
 
 DATA STRUCTURE COMMANDS
-
-    block         Interact with raw blocks in the datastore
-    object        Interact with raw dag nodes
-    file          Interact with Unix filesystem objects
+  block         Interact with raw blocks in the datastore
+  object        Interact with raw dag nodes
+  files         Interact with objects as if they were a unix filesystem
+  dag           Interact with IPLD documents (experimental)
 
 ADVANCED COMMANDS
-
-    daemon        Start a long-running daemon process
-    mount         Mount an ipfs read-only mountpoint
-    resolve       Resolve any type of name
-    name          Publish or resolve IPNS names
-    dns           Resolve DNS links
-    pin           Pin objects to local storage
-    repo gc       Garbage collect unpinned objects
+  daemon        Start a long-running daemon process
+  mount         Mount an IPFS read-only mountpoint
+  resolve       Resolve any type of name
+  name          Publish or resolve IPNS names
+  dns           Resolve DNS links
+  pin           Pin objects to local storage
+  repo          Manipulate the IPFS repository
+  stats         Various operational stats
+  key           Create and manipulate keypairs
 
 NETWORK COMMANDS
-
-    id            Show info about ipfs peers
-    bootstrap     Add or remove bootstrap peers
-    swarm         Manage connections to the p2p network
-    dht           Query the dht for values or peers
-    ping          Measure the latency of a connection
-    diag          Print diagnostics
+  id            Show info about IPFS peers
+  bootstrap     Add or remove bootstrap peers
+  swarm         Manage connections to the p2p network
+  dht           Query the DHT for values or peers
+  ping          Measure the latency of a connection
+  diag          Print diagnostics
 
 TOOL COMMANDS
-
-    config        Manage configuration
-    version       Show ipfs version information
-    update        Download and apply go-ipfs updates
-    commands      List all available commands
+  config        Manage configuration
+  version       Show ipfs version information
+  update        Download and apply go-ipfs updates
+  commands      List all available commands
 
 Use 'ipfs <command> --help' to learn more about each command.
+
+ipfs uses a repository in the local file system. By default, the repo is located
+at ~/.ipfs. To change the repo location, set the $IPFS_PATH environment variable:
+
+  export IPFS_PATH=/path/to/ipfsrepo
+
+EXIT STATUS
+
+The CLI will exit with one of the following values:
+
+0     Successful execution.
+1     Failed executions.
 `,
 	},
 	Options: []cmds.Option{
-		cmds.StringOption("config", "c", "Path to the configuration file to use"),
-		cmds.BoolOption("debug", "D", "Operate in debug mode"),
-		cmds.BoolOption("help", "Show the full command help text"),
-		cmds.BoolOption("h", "Show a short version of the command help text"),
-		cmds.BoolOption("local", "L", "Run the command locally, instead of using the daemon"),
-		cmds.StringOption(ApiOption, "Overrides the routing option (dht, supernode)"),
+		cmds.StringOption("config", "c", "Path to the configuration file to use."),
+		cmds.BoolOption("debug", "D", "Operate in debug mode.").Default(false),
+		cmds.BoolOption("help", "Show the full command help text.").Default(false),
+		cmds.BoolOption("h", "Show a short version of the command help text.").Default(false),
+		cmds.BoolOption("local", "L", "Run the command locally, instead of using the daemon.").Default(false),
+		cmds.StringOption(ApiOption, "Use a specific API instance (defaults to /ip4/127.0.0.1/tcp/5001)"),
 	},
 }
 
@@ -91,18 +97,22 @@ var rootSubcommands = map[string]*cmds.Command{
 	"cat":       CatCmd,
 	"commands":  CommandsDaemonCmd,
 	"config":    ConfigCmd,
+	"dag":       dag.DagCmd,
 	"dht":       DhtCmd,
 	"diag":      DiagCmd,
 	"dns":       DNSCmd,
+	"files":     files.FilesCmd,
 	"get":       GetCmd,
 	"id":        IDCmd,
+	"key":       KeyCmd,
 	"log":       LogCmd,
 	"ls":        LsCmd,
 	"mount":     MountCmd,
 	"name":      NameCmd,
-	"object":    ObjectCmd,
+	"object":    ocmd.ObjectCmd,
 	"pin":       PinCmd,
 	"ping":      PingCmd,
+	"pubsub":    PubsubCmd,
 	"refs":      RefsCmd,
 	"repo":      RepoCmd,
 	"resolve":   ResolveCmd,
@@ -111,7 +121,7 @@ var rootSubcommands = map[string]*cmds.Command{
 	"tar":       TarCmd,
 	"tour":      tourCmd,
 	"file":      unixfs.UnixFSCmd,
-	"update":    UpdateCmd,
+	"update":    ExternalBinary(),
 	"version":   VersionCmd,
 	"bitswap":   BitswapCmd,
 }
@@ -132,6 +142,8 @@ var rootROSubcommands = map[string]*cmds.Command{
 	},
 	"cat":      CatCmd,
 	"commands": CommandsDaemonROCmd,
+	"dns":      DNSCmd,
+	"get":      GetCmd,
 	"ls":       LsCmd,
 	"name": &cmds.Command{
 		Subcommands: map[string]*cmds.Command{
@@ -140,17 +152,25 @@ var rootROSubcommands = map[string]*cmds.Command{
 	},
 	"object": &cmds.Command{
 		Subcommands: map[string]*cmds.Command{
-			"data":  objectDataCmd,
-			"links": objectLinksCmd,
-			"get":   objectGetCmd,
-			"stat":  objectStatCmd,
+			"data":  ocmd.ObjectDataCmd,
+			"links": ocmd.ObjectLinksCmd,
+			"get":   ocmd.ObjectGetCmd,
+			"stat":  ocmd.ObjectStatCmd,
+			"patch": ocmd.ObjectPatchCmd,
 		},
 	},
-	"refs": RefsROCmd,
-	//"resolve": ResolveCmd,
+	"dag": &cmds.Command{
+		Subcommands: map[string]*cmds.Command{
+			"get": dag.DagGetCmd,
+		},
+	},
+	"refs":    RefsROCmd,
+	"resolve": ResolveCmd,
+	"version": VersionCmd,
 }
 
 func init() {
+	Root.ProcessHelp()
 	*RootRO = *Root
 
 	// sanitize readonly refs command
